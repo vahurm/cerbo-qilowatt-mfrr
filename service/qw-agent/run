@@ -1,0 +1,13 @@
+#!/bin/sh
+# daemontools service for qw_agent.py (Venus OS /service supervisor).
+# Keep this under /data (persistent) and symlink it into /service so it survives
+# firmware updates: ln -s /data/qw-agent/service/qw-agent /service/qw-agent
+# (deploy/install.sh does this and adds the re-link to /data/rc.local).
+exec 2>&1
+
+AGENT_DIR=/data/qw-agent
+
+export QW_AGENT_ENV="${QW_AGENT_ENV:-/data/qw-agent.env}"
+export PYTHONPATH="${AGENT_DIR}/pylib:${PYTHONPATH}"
+
+exec python3 "${AGENT_DIR}/qw_agent.py"

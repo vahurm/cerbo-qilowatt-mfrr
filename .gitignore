@@ -1,0 +1,26 @@
+# Secrets / per-site config — NEVER commit
+.env
+*.env
+!.env.example
+*.local
+secrets/
+*.key
+*.pem
+authorized_keys
+
+# Build artifacts (vendored deps for deploy)
+build/
+pylib/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+*.swp
+*~

@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Match the Venus OS / Cerbo runtime (Python 3.12.x).
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r agent/requirements.txt -r requirements-dev.txt
+
+      - name: Run Python tests
+        run: pytest -q
+
+      - name: Run shell tests (setpoint clamp)
+        run: sh tests/test_grid_setpoint.sh

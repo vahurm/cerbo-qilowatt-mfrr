@@ -1,0 +1,8 @@
+# Python dependencies for qw_agent.py
+#
+# NOTE: dbus access uses the system-provided python3-dbus on Venus OS, which is
+# NOT installed via pip. See docs/INSTALL.md. The packages below are pip-installable
+# (vendor them under /data on the Cerbo so they survive firmware updates).
+qilowatt>=2026.3.5
+paho-mqtt>=2.0.0
+getmac>=0.8.3
