@@ -49,6 +49,16 @@ scp_ "$REPO_DIR"/agent/qw_agent.py "$REPO_DIR"/agent/mfrr_statemachine.py \
 scp_ -r "$REPO_DIR"/agent/telemetry "$CERBO_HOST":/data/qw-agent/
 scp_ -r "$BUILD_LIB"/. "$CERBO_HOST":/data/qw-agent/pylib/
 
+# --- 3b. Read-only diagnostics (aFRR verification) -------------------------
+# afrr_probe.py classifies the WORKMODE stream; afrr_capture.sh is a durable,
+# read-only WORKMODE tap. Neither touches dbus or the actuators. Capture is NOT
+# auto-started here — run `/data/afrr_capture.sh start` when verifying (see
+# docs/AFRR_VERIFICATION.md).
+echo "==> Installing read-only diagnostics (afrr_probe.py, afrr_capture.sh)"
+scp_ "$REPO_DIR"/tools/afrr_probe.py "$CERBO_HOST":/data/qw-agent/afrr_probe.py
+scp_ "$REPO_DIR"/tools/afrr_capture.sh "$CERBO_HOST":/data/afrr_capture.sh
+ssh_ 'chmod 755 /data/qw-agent/afrr_probe.py /data/afrr_capture.sh'
+
 # --- 4. Per-site config (never overwrite existing secrets) ------------------
 if ssh_ 'test -f /data/qw-agent.env'; then
   echo "==> /data/qw-agent.env exists — leaving it untouched"
