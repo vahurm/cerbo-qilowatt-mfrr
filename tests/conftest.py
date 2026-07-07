@@ -17,8 +17,9 @@ import pytest
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _AGENT_DIR = os.path.join(_REPO_ROOT, "agent")
 _PYLIB_DIR = os.path.join(_REPO_ROOT, "pylib")
+_TOOLS_DIR = os.path.join(_REPO_ROOT, "tools")
 
-for _path in (_AGENT_DIR, _PYLIB_DIR):
+for _path in (_AGENT_DIR, _PYLIB_DIR, _TOOLS_DIR):
     if os.path.isdir(_path) and _path not in sys.path:
         sys.path.insert(0, _path)
 
