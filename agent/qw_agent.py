@@ -103,6 +103,22 @@ class Config:
         # good and never reconnects while our process keeps running — the
         # supervisor cannot help unless we actually exit. 0 disables.
         self.link_restart_s = float(os.environ.get("QW_LINK_RESTART_S", "600"))
+        # Zombie-subscription watchdog: qilowatt-py explicitly keeps a session
+        # marked "connected" even when the WORKMODE re-subscribe fails ("still
+        # mark as connected so publishing works, just won't receive commands").
+        # In that state telemetry keeps flowing but we go permanently deaf to
+        # commands while our connection callback reports healthy — the link
+        # failsafe above never fires. If the transport is connected but the
+        # command topic is not subscribed for this long, exit for a fresh
+        # restart. 0 disables.
+        self.subscribe_grace_s = float(os.environ.get("QW_SUBSCRIBE_GRACE_S", "120"))
+        # Backstop for silently deaf sessions that still report subscribed
+        # (half-dead socket the broker/keepalive never tears down): once the
+        # agent has been up this long AND is IDLE AND has been command-quiet,
+        # exit for a fresh subscription. An in-process reconnect cannot help —
+        # qilowatt-py starts its telemetry timers exactly once — so a clean
+        # process restart is the only safe refresh. 0 disables.
+        self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "3600"))
 
         # Telemetry
         self.telemetry_profile = os.environ.get("QW_TELEMETRY_PROFILE", "dc_coupled")
@@ -252,6 +268,93 @@ class LinkMonitor:
             return time.monotonic() - self._down_since
 
 
+class ConnectionWatchdog:
+    """Decides when the agent must exit for a clean supervisor restart.
+
+    qilowatt-py's connection callback is not a trustworthy liveness signal:
+
+      * after a failed WORKMODE re-subscribe it *still* reports "connected"
+        (its own comment: "still mark as connected so publishing works ... just
+        won't receive commands"), so ``LinkMonitor`` sees a healthy link while
+        we are permanently deaf to commands;
+      * a half-dead socket the broker/keepalive never tears down can keep the
+        session "connected" *and* "subscribed" yet deliver nothing.
+
+    An in-process reconnect cannot recover either case: qilowatt-py starts its
+    telemetry timers exactly once (``_data_initialized`` latches True), so
+    ``disconnect()``/``connect()`` would silence telemetry forever. The only
+    clean recovery is to exit so daemontools starts a fresh process. This
+    watchdog folds together three exit triggers and returns a human-readable
+    reason (or ``None``):
+
+      1. link reported down longer than ``link_restart_s`` (qilowatt-py gave up);
+      2. transport connected but command topic unsubscribed > ``subscribe_grace_s``;
+      3. periodic idle refresh once uptime >= ``idle_refresh_s`` (only while IDLE
+         and command-quiet, so an active mFRR event is never interrupted).
+    """
+
+    def __init__(
+        self,
+        link_restart_s: float,
+        subscribe_grace_s: float,
+        idle_refresh_s: float,
+        quiet_before_refresh_s: float = 60.0,
+    ) -> None:
+        self._link_restart_s = link_restart_s
+        self._subscribe_grace_s = subscribe_grace_s
+        self._idle_refresh_s = idle_refresh_s
+        self._quiet_before_refresh_s = quiet_before_refresh_s
+        self._start = time.monotonic()
+        self._sub_bad_since: Optional[float] = None
+        self._last_command_at = self._start
+
+    def note_command(self) -> None:
+        """Record that a WORKMODE command was just received."""
+        self._last_command_at = time.monotonic()
+
+    def check(
+        self,
+        transport_connected: bool,
+        subscribed: bool,
+        link_down_s: float,
+        state: str,
+    ) -> Optional[str]:
+        """Return a restart reason if the agent should exit, else ``None``."""
+        now = time.monotonic()
+
+        if self._link_restart_s > 0 and link_down_s >= self._link_restart_s:
+            return (
+                f"QW link down for {link_down_s:.0f}s (>= {self._link_restart_s:.0f}s); "
+                "qilowatt-py may have given up permanently"
+            )
+
+        if self._subscribe_grace_s > 0:
+            if transport_connected and not subscribed:
+                if self._sub_bad_since is None:
+                    self._sub_bad_since = now
+                elif now - self._sub_bad_since >= self._subscribe_grace_s:
+                    return (
+                        "QW transport connected but command subscription dead for "
+                        f"{now - self._sub_bad_since:.0f}s (>= {self._subscribe_grace_s:.0f}s); "
+                        "deaf to WORKMODE"
+                    )
+            else:
+                self._sub_bad_since = None
+
+        if (
+            self._idle_refresh_s > 0
+            and state == "IDLE"
+            and now - self._start >= self._idle_refresh_s
+            and now - self._last_command_at >= self._quiet_before_refresh_s
+        ):
+            return (
+                f"periodic idle session refresh after {now - self._start:.0f}s uptime "
+                "(guards against silently deaf sessions)"
+            )
+
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -295,8 +398,15 @@ def main() -> int:
 
     device = InverterDevice(device_id=cfg.device_id)
 
+    watchdog = ConnectionWatchdog(
+        link_restart_s=cfg.link_restart_s,
+        subscribe_grace_s=cfg.subscribe_grace_s,
+        idle_refresh_s=cfg.idle_refresh_s,
+    )
+
     def on_command(command: WorkModeCommand) -> None:
         _logger.info("WORKMODE received: %s", command.to_dict())
+        watchdog.note_command()
         for handler in command_handlers:
             try:
                 handler(command)
@@ -354,17 +464,20 @@ def main() -> int:
     try:
         while not stop_event.is_set():
             stop_event.wait(1.0)
-            if cfg.link_restart_s > 0:
-                down = link.down_for()
-                if down >= cfg.link_restart_s:
-                    _logger.error(
-                        "QW link down for %.0fs (>= %.0fs); exiting so the "
-                        "supervisor restarts the agent (qilowatt-py may have "
-                        "given up permanently).",
-                        down, cfg.link_restart_s,
-                    )
-                    exit_code = 3
-                    break
+            reason = watchdog.check(
+                transport_connected=client.transport_connected,
+                subscribed=client.subscribed,
+                link_down_s=link.down_for(),
+                state=controller.state,
+            )
+            if reason:
+                _logger.error(
+                    "%s; exiting so the supervisor restarts the agent with a "
+                    "fresh QW connection.",
+                    reason,
+                )
+                exit_code = 3
+                break
     finally:
         _logger.info("Stopping qw_agent")
         tick.stop()
