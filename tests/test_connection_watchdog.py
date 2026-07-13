@@ -103,20 +103,21 @@ def test_transport_down_does_not_count_as_subscription_failure(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# 3) periodic idle refresh backstop
+# 3) command-silence refresh backstop (keyed on time since last WORKMODE)
 # --------------------------------------------------------------------------- #
 
-def test_idle_refresh_after_uptime(monkeypatch):
+def test_refresh_after_command_silence(monkeypatch):
     clock = _patch_clock(monkeypatch)
     wd = _watchdog(idle_refresh_s=3600.0)
+    # No command ever received: silence is measured from startup.
     clock.advance(3599)
     assert _healthy(wd) is None
     clock.advance(1)
     reason = _healthy(wd)
-    assert reason is not None and "idle session refresh" in reason
+    assert reason is not None and "no WORKMODE command received" in reason
 
 
-def test_idle_refresh_skipped_while_active(monkeypatch):
+def test_refresh_skipped_while_active(monkeypatch):
     clock = _patch_clock(monkeypatch)
     wd = _watchdog(idle_refresh_s=3600.0)
     clock.advance(7200)
@@ -124,18 +125,29 @@ def test_idle_refresh_skipped_while_active(monkeypatch):
     assert wd.check(transport_connected=True, subscribed=True, link_down_s=0.0, state="ACTIVE") is None
 
 
-def test_idle_refresh_skipped_when_recently_commanded(monkeypatch):
+def test_received_command_resets_silence_timer(monkeypatch):
     clock = _patch_clock(monkeypatch)
-    wd = _watchdog(idle_refresh_s=3600.0, quiet_before_refresh_s=60.0)
-    clock.advance(7200)
-    wd.note_command()  # a command just arrived
-    clock.advance(30)
-    assert _healthy(wd) is None  # still within the quiet window
-    clock.advance(31)
-    assert _healthy(wd) is not None  # quiet window elapsed -> refresh allowed
+    wd = _watchdog(idle_refresh_s=3600.0)
+    clock.advance(3000)
+    wd.note_command()  # a command arrived before the threshold
+    clock.advance(3599)
+    assert _healthy(wd) is None  # only 3599s since the last command
+    clock.advance(1)
+    reason = _healthy(wd)
+    assert reason is not None and "no WORKMODE command received" in reason
 
 
-def test_idle_refresh_disabled(monkeypatch):
+def test_periodic_commands_prevent_refresh(monkeypatch):
+    clock = _patch_clock(monkeypatch)
+    wd = _watchdog(idle_refresh_s=3600.0)
+    # Hourly-heartbeat site: a command every 30 min (< threshold) -> never refreshes.
+    for _ in range(20):
+        clock.advance(1800)
+        wd.note_command()
+        assert _healthy(wd) is None
+
+
+def test_refresh_disabled(monkeypatch):
     clock = _patch_clock(monkeypatch)
     wd = _watchdog(idle_refresh_s=0.0)
     clock.advance(100000)

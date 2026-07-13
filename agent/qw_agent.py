@@ -113,12 +113,16 @@ class Config:
         # restart. 0 disables.
         self.subscribe_grace_s = float(os.environ.get("QW_SUBSCRIBE_GRACE_S", "120"))
         # Backstop for silently deaf sessions that still report subscribed
-        # (half-dead socket the broker/keepalive never tears down): once the
-        # agent has been up this long AND is IDLE AND has been command-quiet,
-        # exit for a fresh subscription. An in-process reconnect cannot help —
-        # qilowatt-py starts its telemetry timers exactly once — so a clean
-        # process restart is the only safe refresh. 0 disables.
-        self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "3600"))
+        # (half-dead socket the broker/keepalive never tears down): if NO WORKMODE
+        # command is received for this long while IDLE, exit for a fresh
+        # subscription. A received command (incl. periodic NORMAL heartbeats)
+        # proves the subscription is live, so a site that keeps getting commands
+        # never restarts; only genuine command-silence triggers a refresh. Must be
+        # comfortably larger than the longest expected gap between commands. An
+        # in-process reconnect cannot help — qilowatt-py starts its telemetry
+        # timers exactly once — so a clean process restart is the only safe
+        # refresh. 0 disables.
+        self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "21600"))
 
         # Telemetry
         self.telemetry_profile = os.environ.get("QW_TELEMETRY_PROFILE", "dc_coupled")
@@ -289,8 +293,11 @@ class ConnectionWatchdog:
 
       1. link reported down longer than ``link_restart_s`` (qilowatt-py gave up);
       2. transport connected but command topic unsubscribed > ``subscribe_grace_s``;
-      3. periodic idle refresh once uptime >= ``idle_refresh_s`` (only while IDLE
-         and command-quiet, so an active mFRR event is never interrupted).
+      3. no WORKMODE command received for >= ``idle_refresh_s`` while IDLE. A
+         received command (including periodic NORMAL heartbeats) proves the
+         subscription is live, so this only fires after genuine command-silence
+         long enough to suspect a silently deaf session; an active mFRR event is
+         never interrupted.
     """
 
     def __init__(
@@ -298,12 +305,10 @@ class ConnectionWatchdog:
         link_restart_s: float,
         subscribe_grace_s: float,
         idle_refresh_s: float,
-        quiet_before_refresh_s: float = 60.0,
     ) -> None:
         self._link_restart_s = link_restart_s
         self._subscribe_grace_s = subscribe_grace_s
         self._idle_refresh_s = idle_refresh_s
-        self._quiet_before_refresh_s = quiet_before_refresh_s
         self._start = time.monotonic()
         self._sub_bad_since: Optional[float] = None
         self._last_command_at = self._start
@@ -344,12 +349,12 @@ class ConnectionWatchdog:
         if (
             self._idle_refresh_s > 0
             and state == "IDLE"
-            and now - self._start >= self._idle_refresh_s
-            and now - self._last_command_at >= self._quiet_before_refresh_s
+            and now - self._last_command_at >= self._idle_refresh_s
         ):
             return (
-                f"periodic idle session refresh after {now - self._start:.0f}s uptime "
-                "(guards against silently deaf sessions)"
+                f"no WORKMODE command received for {now - self._last_command_at:.0f}s "
+                f"(>= {self._idle_refresh_s:.0f}s) while IDLE; refreshing the session "
+                "in case it is silently deaf"
             )
 
         return None
