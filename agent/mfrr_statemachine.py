@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from qilowatt import WorkModeCommand
 
@@ -42,12 +42,18 @@ class MfrrController:
         mqtt_lost_failsafe_s: float = 300.0,
         max_duration_s: float = 1800.0,
         dess_off_delay_s: float = 2.0,
+        on_state_change: Optional[Callable[[str, int], None]] = None,
     ) -> None:
         self._act = actuator
         self._sources = tuple(s.strip().lower() for s in mfrr_sources)
         self._mqtt_lost_failsafe_s = mqtt_lost_failsafe_s
         self._max_duration_s = max_duration_s
         self._dess_off_delay_s = dess_off_delay_s
+        # Optional hook fired (state, signed_watts) on every ACTIVE/IDLE change.
+        # Used to bridge the mFRR state to a local broker so the Node-RED
+        # curtailment flow can stand down while mFRR owns the grid setpoint.
+        # Set as a public attribute so it can be wired after construction.
+        self.on_state_change = on_state_change
 
         self._lock = threading.RLock()
         self._state = "IDLE"
@@ -126,6 +132,22 @@ class MfrrController:
         with self._lock:
             return self._state
 
+    @property
+    def last_signed_watts(self) -> int:
+        """Current signed mFRR setpoint (neg=frrup/export, pos=frrdown/import)."""
+        with self._lock:
+            return self._last_signed_watts
+
+    def _notify(self) -> None:
+        """Fire the state-change hook; never let a listener break the machine."""
+        cb = self.on_state_change
+        if cb is None:
+            return
+        try:
+            cb(self._state, self._last_signed_watts)
+        except Exception as exc:  # pragma: no cover - defensive
+            _logger.error("on_state_change callback error: %s", exc)
+
     # ------------------------------------------------------------------ #
     # Transitions (call with the lock held)
     # ------------------------------------------------------------------ #
@@ -137,6 +159,7 @@ class MfrrController:
                 self._last_signed_watts = signed
                 _logger.info("mFRR setpoint update: %s W", signed)
                 self._act.set_setpoint(signed)
+                self._notify()
         elif self._state == "ACTIVE" and not is_mfrr:
             self._revert()
 
@@ -157,6 +180,7 @@ class MfrrController:
         timer.daemon = True
         self._pending_timer = timer
         timer.start()
+        self._notify()
 
     def _apply_delayed_setpoint(self, token: int) -> None:
         with self._lock:
@@ -178,3 +202,4 @@ class MfrrController:
         # Release the setpoint before restoring DESS so they don't fight.
         self._act.set_setpoint(0)
         self._act.dess_on()
+        self._notify()

@@ -226,3 +226,42 @@ def test_source_and_mode_are_case_insensitive(actuator, clock, timers, make_comm
     timers.fire_pending()
     assert ctrl.state == "ACTIVE"
     assert actuator.setpoints == [-2000]
+
+
+# --------------------------------------------------------------------------- #
+# State-change hook (local-bridge / Node-RED coexistence)
+# --------------------------------------------------------------------------- #
+
+def test_on_state_change_fires_on_enter_update_and_revert(
+    actuator, clock, timers, make_command
+):
+    events = []
+    ctrl = make_controller(actuator)
+    ctrl.on_state_change = lambda state, signed: events.append((state, signed))
+
+    # Enter: frrup export -> ACTIVE with negative signed watts.
+    ctrl.on_workmode(make_command(source="fusebox", mode="frrup", power=5000))
+    assert events[-1] == ("ACTIVE", -5000)
+
+    # Setpoint update while ACTIVE -> another ACTIVE notification.
+    ctrl.on_workmode(make_command(source="fusebox", mode="frrup", power=7000))
+    assert events[-1] == ("ACTIVE", -7000)
+
+    # Revert -> IDLE with signed 0.
+    ctrl.on_workmode(make_command(source="grid", mode="normal", power=0))
+    assert events[-1] == ("IDLE", 0)
+
+
+def test_on_state_change_faulty_listener_does_not_break_machine(
+    actuator, clock, timers, make_command
+):
+    def boom(state, signed):
+        raise RuntimeError("listener blew up")
+
+    ctrl = make_controller(actuator)
+    ctrl.on_state_change = boom
+    # Must still transition normally despite the raising listener.
+    ctrl.on_workmode(make_command(source="fusebox", mode="frrdown", power=3000))
+    assert ctrl.state == "ACTIVE"
+    timers.fire_pending()
+    assert actuator.setpoints == [3000]
