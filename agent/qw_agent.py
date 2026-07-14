@@ -151,12 +151,18 @@ class LocalBridge:
             client.username_pw_set(cfg.local_user, cfg.local_pass)
         client.will_set(self._online_topic, payload="false", qos=0, retain=True)
         client.reconnect_delay_set(min_delay=2, max_delay=30)
+        client.on_connect = self._on_connect
         self._client = client
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None) -> None:
+        # (Re)assert liveness after every (re)connect. Publishing at start()
+        # races the async connect and the retained QoS0 message is dropped while
+        # still disconnected, so the authoritative online=true is set here.
+        client.publish(self._online_topic, "true", qos=0, retain=True)
 
     def start(self) -> None:
         self._client.connect_async(self._cfg.local_host, self._cfg.local_port, keepalive=30)
         self._client.loop_start()
-        self._client.publish(self._online_topic, "true", qos=0, retain=True)
 
     def stop(self) -> None:
         try:
@@ -182,6 +188,17 @@ class LocalBridge:
 
     def publish_connected(self, connected: bool) -> None:
         self._pub("qw_connected", "on" if connected else "off")
+
+    def publish_mfrr(self, state: str, signed_watts: int) -> None:
+        """Publish the derived mFRR event state for the curtailment flow.
+
+        ``mfrr_active`` lets the Node-RED Huawei-curtailment flow stand down
+        (hold 100%) while mFRR owns the grid setpoint, so it never fights an
+        frr-up export or frr-down import. ``mfrr_signed_w`` is informational
+        (negative = frrup/export, positive = frrdown/import).
+        """
+        self._pub("mfrr_active", "on" if state == "ACTIVE" else "off")
+        self._pub("mfrr_signed_w", str(int(signed_watts)))
 
 
 # --------------------------------------------------------------------------- #
@@ -400,6 +417,19 @@ def main() -> int:
         bridge.start()
         command_handlers.append(bridge.publish_workmode)
         connection_handlers.append(bridge.publish_connected)
+        # Bridge the mFRR event state so the Node-RED curtailment flow stands
+        # down while mFRR owns the grid setpoint. Publish a retained baseline
+        # immediately so the flow has a known state before the first event.
+        controller.on_state_change = bridge.publish_mfrr
+        # Republish the current mFRR state on every QW (re)connect so a retained
+        # baseline exists before the first event and survives reconnects. Read
+        # from the controller so a reconnect mid-event re-asserts "on", not "off".
+        connection_handlers.append(
+            lambda connected: (
+                bridge.publish_mfrr(controller.state, controller.last_signed_watts)
+                if connected else None
+            )
+        )
 
     device = InverterDevice(device_id=cfg.device_id)
 
