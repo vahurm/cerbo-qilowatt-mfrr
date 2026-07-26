@@ -85,6 +85,7 @@ reset() {
 }
 SAVED_MODE="$TMP/state/qw_dess_saved_mode"
 SAVED_MINSOC="$TMP/state/qw_dess_saved_minsoc"
+EVENT_MINSOC="$TMP/state/qw_dess_event_minsoc"
 
 run() { env QW_STATE_DIR="$TMP/state" "$@" sh "$TARGET"; }
 
@@ -128,6 +129,35 @@ reset
 env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" on >/dev/null 2>&1
 assert_eq "floor unchanged at 25"        "25.0" "$(get_dbus "$MINSOC_PATH")"
 assert_eq "DESS Mode default-restored 1" "1"    "$(get_dbus "$MODE_PATH")"
+
+echo "=== scenario 6: off records the installed Y, cleaned up by on ==="
+reset
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" off >/dev/null 2>&1
+assert_eq "installed floor recorded as 20" "20" "$(cat "$EVENT_MINSOC" 2>/dev/null)"
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" on >/dev/null 2>&1
+assert_absent "installed-floor file removed after on" "$EVENT_MINSOC"
+
+echo "=== scenario 7: floor changed mid-event is KEPT, X not restored ==="
+reset
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" off >/dev/null 2>&1
+set_dbus "$MINSOC_PATH" 30.0   # owner raises the floor in VRM mid-event
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" on >/dev/null 2>&1
+assert_eq "owner's 30 kept, not reverted to 25" "30.0" "$(get_dbus "$MINSOC_PATH")"
+assert_absent "saved-floor file cleared"        "$SAVED_MINSOC"
+assert_absent "installed-floor file cleared"    "$EVENT_MINSOC"
+
+echo "=== scenario 8: watchdog path (no QW_MFRR_MIN_SOC) still restores X ==="
+reset
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" off >/dev/null 2>&1
+env QW_STATE_DIR="$TMP/state" sh "$TARGET" on >/dev/null 2>&1
+assert_eq "floor restored to 25 without Y in env" "25" "$(get_dbus "$MINSOC_PATH")"
+
+echo "=== scenario 9: watchdog path also honours a mid-event change ==="
+reset
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" off >/dev/null 2>&1
+set_dbus "$MINSOC_PATH" 30.0
+env QW_STATE_DIR="$TMP/state" sh "$TARGET" on >/dev/null 2>&1
+assert_eq "owner's 30 kept on watchdog path" "30.0" "$(get_dbus "$MINSOC_PATH")"
 
 echo "-----------------------------------------"
 echo "passed: $pass   failed: $fail"
