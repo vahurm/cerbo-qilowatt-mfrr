@@ -133,6 +133,11 @@ class Config:
         # timers exactly once — so a clean process restart is the only safe
         # refresh. 0 disables.
         self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "21600"))
+        # Venus OS starts this service before the network is reliably up, so the
+        # first DNS resolve can fail; retry briefly instead of dying on a
+        # traceback. The supervisor stays the final backstop once these run out.
+        self.connect_attempts = int(os.environ.get("QW_CONNECT_ATTEMPTS", "5"))
+        self.connect_retry_s = float(os.environ.get("QW_CONNECT_RETRY_S", "5"))
 
         # Telemetry
         self.telemetry_profile = os.environ.get("QW_TELEMETRY_PROFILE", "dc_coupled")
@@ -391,6 +396,37 @@ class ConnectionWatchdog:
 # Main
 # --------------------------------------------------------------------------- #
 
+def connect_with_retry(
+    client,
+    attempts: int,
+    retry_s: float,
+    sleep=time.sleep,
+) -> None:
+    """Open the QW connection, tolerating a transient resolve/network failure.
+
+    Kungla crashed here ~twice a day: the service starts before the network is
+    ready and ``socket.gaierror`` ("Temporary failure in name resolution")
+    escaped as an unhandled traceback. The supervisor did restart us, so nothing
+    stayed broken, but 46 tracebacks buried the log and every crash dropped
+    telemetry. A short bounded backoff rides the outage out; if it persists we
+    still raise, leaving the supervisor as the final backstop.
+    """
+    delay = retry_s
+    for attempt in range(1, max(attempts, 1) + 1):
+        try:
+            client.connect()
+            return
+        except OSError as exc:
+            if attempt >= attempts:
+                raise
+            _logger.warning(
+                "QW connect attempt %d/%d failed: %s; retrying in %.0fs",
+                attempt, attempts, exc, delay,
+            )
+            sleep(delay)
+            delay = min(delay * 2.0, 60.0)
+
+
 def main() -> int:
     _load_env_file(os.environ.get("QW_AGENT_ENV", "/data/qw-agent.env"))
     cfg = Config()
@@ -494,7 +530,7 @@ def main() -> int:
     tick = TickThread(controller, cfg.tick_interval_s)
     tick.start()
 
-    client.connect()
+    connect_with_retry(client, cfg.connect_attempts, cfg.connect_retry_s)
 
     stop_event = threading.Event()
 
