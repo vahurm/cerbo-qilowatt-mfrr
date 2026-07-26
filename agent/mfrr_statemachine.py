@@ -14,7 +14,7 @@ State diagram:
       ^                                                               |
       |  setpoint 0 + DESS on                 DESS off, then signed setpoint
       +---------------------------------------------------------------+
-         (non-FRR source or Mode | mqtt_lost>5min | event>30min)
+         (non-FRR source or Mode | mqtt_lost>5min | event>max_duration)
 
 Both gates matter. A single `_source` speaks several dialects: the `qilowatt`
 source sends `frrup`/`frrdown` balancing dispatch *and* `buy` optimiser trades.
