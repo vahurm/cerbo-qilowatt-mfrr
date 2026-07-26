@@ -99,6 +99,13 @@ charges.
   `QW_MFRR_MIN_SOC`: it must be below the dashboard's Minimum SOC slider, and the
   log says `Lowered SOC floor X% -> Y%` when it works and `nothing to lower` when
   it does not.
+- **Beware the decoy floor register.** Some sites also carry
+  `/Settings/DynamicEss/MinSoc`, which looks like the DESS floor but is not the one
+  this build honours — verify with `/Control/ActiveSocLimit`, which follows
+  `MinimumSocLimit`. Where the decoy exists, keep it equal to the dashboard slider
+  so nobody later reads it as the live floor. Aligning it that way is a no-op
+  whether the firmware ignores the register or ever starts honouring it; deleting
+  it is not, because the value it would be recreated with is unknown.
 - **Never run two orchestrators at once** (e.g. an old HA automation, the agent's
   state machine, and a Node-RED actuator flow) — they write the same dbus paths and
   will race.
