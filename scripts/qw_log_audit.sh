@@ -25,51 +25,27 @@
 #   0 = nothing, or only informational findings
 #   1 = at least one WARN/ERROR finding (usable as a cron/monitor trigger)
 #
+# A deaf site produces NO new log lines at all, so the command-silence check runs
+# unconditionally, keyed on the capture log's mtime rather than the agent log.
+# That matters most where QW_IDLE_REFRESH_S is 0: with the restart backstop off,
+# this warning is the only thing left that notices a site going quiet.
+#
 # Env overrides:
 #   QW_LOG_DIR                (default /var/log/qw-agent)
 #   QW_STATE_DIR              (default /data)  — where the progress file lives
+#   QW_CAPTURE_LOG            (default /data/afrr-workmode.log)
 #   QW_HEALTH_MAX_RESTARTS    (default 3)      — restarts per run before warning
+#   QW_HEALTH_MAX_SILENCE_H   (default 36)     — command silence before warning
 # =============================================================================
 
 LOG_DIR="${QW_LOG_DIR:-/var/log/qw-agent}"
 CUR="$LOG_DIR/current"
 QW_STATE_DIR="${QW_STATE_DIR:-/data}"
 OFFSET_FILE="${QW_STATE_DIR}/qw_health_offset"
+CAPTURE="${QW_CAPTURE_LOG:-/data/afrr-workmode.log}"
 MAX_RESTARTS="${QW_HEALTH_MAX_RESTARTS:-3}"
+MAX_SILENCE_H="${QW_HEALTH_MAX_SILENCE_H:-36}"
 LOG_TAG="qw_health"
-
-if [ ! -f "$CUR" ]; then
-  echo "qw_health: no agent log at $CUR"
-  exit 0
-fi
-
-total=$(wc -l < "$CUR" 2>/dev/null | tr -d ' ')
-[ -n "$total" ] || total=0
-
-prev=0
-if [ -f "$OFFSET_FILE" ]; then
-  prev=$(cat "$OFFSET_FILE" 2>/dev/null)
-  case "$prev" in
-    '' | *[!0-9]*) prev=0 ;;
-  esac
-fi
-# multilog rotated `current` away, so the old offset no longer maps to it.
-[ "$total" -lt "$prev" ] && prev=0
-
-new=$((total - prev))
-printf '%s\n' "$total" > "$OFFSET_FILE"
-
-if [ "$new" -le 0 ]; then
-  echo "qw_health: no new log lines (at line $total)"
-  exit 0
-fi
-
-window=$(tail -n "$new" "$CUR" 2>/dev/null)
-
-# count <pattern> -> number of matching lines in the new window (0 on no match)
-count() {
-  printf '%s\n' "$window" | grep -c "$1" 2>/dev/null || true
-}
 
 findings=0
 worst=0
@@ -86,6 +62,41 @@ report() {
   case "$sev" in
     ERROR | WARN) worst=1 ;;
   esac
+}
+
+# --- new agent-log lines since the previous run ----------------------------- #
+
+window=""
+if [ ! -f "$CUR" ]; then
+  echo "qw_health: no agent log at $CUR"
+else
+  total=$(wc -l < "$CUR" 2>/dev/null | tr -d ' ')
+  [ -n "$total" ] || total=0
+
+  prev=0
+  if [ -f "$OFFSET_FILE" ]; then
+    prev=$(cat "$OFFSET_FILE" 2>/dev/null)
+    case "$prev" in
+      '' | *[!0-9]*) prev=0 ;;
+    esac
+  fi
+  # multilog rotated `current` away, so the old offset no longer maps to it.
+  [ "$total" -lt "$prev" ] && prev=0
+
+  new=$((total - prev))
+  printf '%s\n' "$total" > "$OFFSET_FILE"
+
+  if [ "$new" -le 0 ]; then
+    echo "qw_health: no new log lines (at line $total)"
+  else
+    window=$(tail -n "$new" "$CUR" 2>/dev/null)
+  fi
+fi
+
+# count <pattern> -> matching lines in the new window (0 when there are none)
+count() {
+  [ -n "$window" ] || { echo 0; return 0; }
+  printf '%s\n' "$window" | grep -c "$1" 2>/dev/null || true
 }
 
 report ERROR "$(count 'Traceback')" \
@@ -111,8 +122,24 @@ if [ "$restarts" -gt "$MAX_RESTARTS" ]; then
     "agent restarted more than $MAX_RESTARTS times in this window"
 fi
 
+# --- command silence (runs even when nothing was logged at all) ------------- #
+
+if [ -f "$CAPTURE" ] && [ "$MAX_SILENCE_H" -gt 0 ]; then
+  mtime=$(date -r "$CAPTURE" +%s 2>/dev/null || stat -c %Y "$CAPTURE" 2>/dev/null)
+  case "$mtime" in
+    '' | *[!0-9]*) mtime='' ;;
+  esac
+  if [ -n "$mtime" ]; then
+    age_h=$(( ($(date +%s) - mtime) / 3600 ))
+    if [ "$age_h" -ge "$MAX_SILENCE_H" ]; then
+      report WARN 1 \
+        "no WORKMODE command for ${age_h}h (>= ${MAX_SILENCE_H}h) — either the market is quiet or the site is silently deaf; check that telemetry still reaches the portal"
+    fi
+  fi
+fi
+
 if [ "$findings" -eq 0 ]; then
-  echo "qw_health: OK — $new new lines, nothing to report"
+  echo "qw_health: OK — nothing to report"
 fi
 
 exit "$worst"

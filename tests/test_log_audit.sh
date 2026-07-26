@@ -57,20 +57,29 @@ assert_missing() {
 
 LOGDIR="$TMP/log"
 STATE="$TMP/state"
+CAPTURE="$TMP/capture.log"
 
 reset() {
   rm -rf "$LOGDIR" "$STATE"
   mkdir -p "$LOGDIR" "$STATE"
   : > "$LOGDIR/current"
+  : > "$CAPTURE"          # mtime = now, i.e. a command just arrived
 }
 
 run() {
-  env QW_LOG_DIR="$LOGDIR" QW_STATE_DIR="$STATE" "$@" sh "$TARGET" 2>&1
+  env QW_LOG_DIR="$LOGDIR" QW_STATE_DIR="$STATE" QW_CAPTURE_LOG="$CAPTURE" \
+      "$@" sh "$TARGET" 2>&1
 }
 # run_rc <extra env...> -> prints exit code only
 run_rc() {
-  env QW_LOG_DIR="$LOGDIR" QW_STATE_DIR="$STATE" "$@" sh "$TARGET" >/dev/null 2>&1
+  env QW_LOG_DIR="$LOGDIR" QW_STATE_DIR="$STATE" QW_CAPTURE_LOG="$CAPTURE" \
+      "$@" sh "$TARGET" >/dev/null 2>&1
   echo $?
+}
+
+# age_capture <hours> — pretend the last captured command arrived that long ago
+age_capture() {
+  touch -d "@$(( $(date +%s) - $1 * 3600 ))" "$CAPTURE"
 }
 
 say() { printf '%s\n' "$1" >> "$LOGDIR/current"; }
@@ -148,6 +157,36 @@ rm -f "$LOGDIR/current"
 out=$(run)
 assert_contains "missing log explained" "no agent log" "$out"
 assert_eq "exit 0 when log absent" "0" "$(run_rc)"
+
+echo "=== scenario 9: a recent command means no silence warning ==="
+reset
+say "2026-07-26 10:00:00 INFO qw_agent: WORKMODE received: {'Mode': 'normal'}"
+out=$(run)
+assert_missing "no silence warning" "no WORKMODE command for" "$out"
+
+echo "=== scenario 10: silence is reported even with nothing new in the log ==="
+# The case that matters: a deaf site logs nothing at all, so a check that needs
+# new log lines would never fire. This is also the only detection left on a site
+# where QW_IDLE_REFRESH_S is 0.
+reset
+run >/dev/null                 # consume the baseline
+age_capture 40
+out=$(run)
+assert_contains "no new log lines noted" "no new log lines" "$out"
+assert_contains "silence still reported" "no WORKMODE command for 40h" "$out"
+assert_eq "exit 1 on silence" "1" "$(run_rc)"
+
+echo "=== scenario 11: silence below the threshold stays quiet ==="
+reset
+age_capture 12
+out=$(run)
+assert_missing "12h is not yet a finding" "no WORKMODE command for" "$out"
+
+echo "=== scenario 12: silence check can be disabled ==="
+reset
+age_capture 99
+out=$(run QW_HEALTH_MAX_SILENCE_H=0)
+assert_missing "disabled by QW_HEALTH_MAX_SILENCE_H=0" "no WORKMODE command for" "$out"
 
 echo "-----------------------------------------"
 echo "passed: $pass   failed: $fail"
