@@ -98,6 +98,10 @@ def test_config_defaults(monkeypatch):
     assert cfg.dry_run is False
     assert cfg.local_bridge is False
     assert cfg.link_restart_s == 600.0
+    assert cfg.subscribe_grace_s == 120.0
+    assert cfg.idle_refresh_s == 21600.0
+    assert cfg.connect_attempts == 5
+    assert cfg.connect_retry_s == 5.0
     assert cfg.mqtt_lost_failsafe_s == 300.0
     assert cfg.max_event_s == 7200.0
 
@@ -140,6 +144,10 @@ def test_config_overrides(monkeypatch):
             "QW_DESS_OFF_DELAY_S": "3",
             "QW_TICK_INTERVAL_S": "5",
             "QW_LINK_RESTART_S": "300",
+            "QW_SUBSCRIBE_GRACE_S": "60",
+            "QW_IDLE_REFRESH_S": "0",
+            "QW_CONNECT_ATTEMPTS": "3",
+            "QW_CONNECT_RETRY_S": "2.5",
             "QW_MFRR_SOURCES": "fusebox, kratt , extra",
             "QW_DRY_RUN": "1",
         }
@@ -156,6 +164,10 @@ def test_config_overrides(monkeypatch):
     assert cfg.dess_off_delay_s == 3.0
     assert cfg.tick_interval_s == 5.0
     assert cfg.link_restart_s == 300.0
+    assert cfg.subscribe_grace_s == 60.0
+    assert cfg.idle_refresh_s == 0.0   # 0 disables the idle-refresh backstop
+    assert cfg.connect_attempts == 3
+    assert cfg.connect_retry_s == 2.5
     assert cfg.mfrr_sources == ("fusebox", "kratt", "extra")
     assert cfg.dry_run is True
 
