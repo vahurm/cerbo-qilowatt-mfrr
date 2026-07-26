@@ -114,12 +114,15 @@ else
   echo "   agent service relink already present"
 fi
 
-# (b) DESS watchdog loop
+# (b) DESS watchdog loop. `sh -c` rather than `( ... ) &` so the loop keeps the
+#     script name in its cmdline — a subshell inherits rc.local's name instead,
+#     which makes the liveness check below silently useless and spawns a
+#     duplicate loop on every re-run.
 if ! grep -q qw_dess_watchdog "$RC"; then
   cat >> "$RC" <<'EOF'
 
 # QW DESS watchdog
-( while true; do /data/qw_dess_watchdog.sh; sleep 60; done ) &
+nohup sh -c 'while true; do /data/qw_dess_watchdog.sh; sleep 60; done' >/dev/null 2>&1 &
 EOF
   echo "   added watchdog loop"
 else
@@ -152,7 +155,7 @@ if ! grep -q qw_log_audit "$RC"; then
   cat >> "$RC" <<'EOF'
 
 # QW log audit — reports new FAILSAFE / crash / watchdog / SOC-floor symptoms
-( while true; do /data/qw_log_audit.sh >/dev/null 2>&1; sleep 3600; done ) &
+nohup sh -c 'while true; do /data/qw_log_audit.sh >/dev/null 2>&1; sleep 3600; done' >/dev/null 2>&1 &
 EOF
   echo "   added log audit loop"
 else
