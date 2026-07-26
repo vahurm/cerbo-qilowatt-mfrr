@@ -23,12 +23,21 @@
 #                                 is set AND the live floor is higher, save the
 #                                 floor and lower it to QW_MFRR_MIN_SOC.
 #   qw_dess_toggle.sh on       -> restore saved DESS Mode (default 1) and the
-#                                 saved SOC floor (if one was saved).
+#                                 saved SOC floor, UNLESS the floor no longer
+#                                 holds the Y we installed — see below.
 #   qw_dess_toggle.sh status   -> print live + saved mode/floor + off-age.
+#
+# The resting floor X belongs to whoever set it (VRM / local GUI), and it may be
+# changed at any time — including while an event is running. So `on` only puts X
+# back if the floor still reads the Y we installed. If it reads anything else,
+# the owner moved it mid-event and restoring X would silently revert them, so we
+# keep their value. The Y we installed is remembered in a file rather than read
+# from the environment, because the watchdog invokes `on` without QW_MFRR_MIN_SOC.
 #
 # Files:
 #   $QW_STATE_DIR/qw_dess_saved_mode    — saved original DESS Mode (for restore)
 #   $QW_STATE_DIR/qw_dess_saved_minsoc  — saved original SOC floor X (for restore)
+#   $QW_STATE_DIR/qw_dess_event_minsoc  — the mFRR floor Y we installed
 #   /tmp/qw_dess_off_at                 — Unix ts when 'off' ran (for watchdog)
 #
 # Env overrides:
@@ -48,6 +57,7 @@ MINSOC_PATH="${QW_MINSOC_DBUS_PATH:-/Settings/CGwacs/BatteryLife/MinimumSocLimit
 QW_STATE_DIR="${QW_STATE_DIR:-/data}"
 SAVED_MODE_FILE="${QW_STATE_DIR}/qw_dess_saved_mode"
 SAVED_MINSOC_FILE="${QW_STATE_DIR}/qw_dess_saved_minsoc"
+EVENT_MINSOC_FILE="${QW_STATE_DIR}/qw_dess_event_minsoc"
 OFF_AT_FILE="/tmp/qw_dess_off_at"
 MFRR_MIN_SOC="${QW_MFRR_MIN_SOC:-}"
 LOG_TAG="qw_dess"
@@ -98,6 +108,7 @@ lower_floor_for_event() {
   fi
 
   echo "$cur_i" > "$SAVED_MINSOC_FILE"
+  echo "$y_i" > "$EVENT_MINSOC_FILE"
   dbus_set "$MINSOC_PATH" "$y_i"
   log "Lowered SOC floor ${cur_i}% -> ${y_i}% for mFRR (saved ${cur_i}% -> $SAVED_MINSOC_FILE)"
 }
@@ -106,10 +117,21 @@ restore_floor_after_event() {
   [ -f "$SAVED_MINSOC_FILE" ] || return 0
   saved=$(cat "$SAVED_MINSOC_FILE")
   if [ -n "$saved" ]; then
+    # Fall back to the env only for events started before this file existed; if
+    # neither is known we cannot tell a foreign change from ours, so we restore.
+    expect=""
+    [ -f "$EVENT_MINSOC_FILE" ] && expect=$(cat "$EVENT_MINSOC_FILE")
+    [ -n "$expect" ] || expect=$(int_part "$MFRR_MIN_SOC")
+    cur_i=$(int_part "$(dbus_get "$MINSOC_PATH")")
+    if [ -n "$expect" ] && [ -n "$cur_i" ] && [ "$cur_i" != "$expect" ]; then
+      log "SOC floor is ${cur_i}%, not the ${expect}% we installed; its owner changed it mid-event, keeping ${cur_i}% and dropping saved ${saved}%"
+      rm -f "$SAVED_MINSOC_FILE" "$EVENT_MINSOC_FILE"
+      return 0
+    fi
     dbus_set "$MINSOC_PATH" "$saved"
     log "Restored SOC floor = ${saved}%"
   fi
-  rm -f "$SAVED_MINSOC_FILE"
+  rm -f "$SAVED_MINSOC_FILE" "$EVENT_MINSOC_FILE"
 }
 
 action="${1:-status}"
@@ -157,6 +179,8 @@ case "$action" in
     floor=$(dbus_get "$MINSOC_PATH")
     saved_floor="(none)"
     [ -f "$SAVED_MINSOC_FILE" ] && saved_floor=$(cat "$SAVED_MINSOC_FILE")
+    event_floor="(none)"
+    [ -f "$EVENT_MINSOC_FILE" ] && event_floor=$(cat "$EVENT_MINSOC_FILE")
     off_at="(none)"
     off_age="-"
     if [ -f "$OFF_AT_FILE" ]; then
@@ -168,6 +192,7 @@ case "$action" in
     echo "Saved Mode          = $saved"
     echo "SOC floor (live)    = ${floor}%"
     echo "Saved SOC floor     = $saved_floor"
+    echo "Installed floor     = $event_floor"
     echo "mFRR floor (Y)      = ${MFRR_MIN_SOC:-(unset -> floor untouched)}"
     echo "OFF since (epoch)   = $off_at"
     echo "OFF age             = $off_age"
