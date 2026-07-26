@@ -151,6 +151,16 @@ out=$(run)
 assert_contains "idle-refresh reported" "idle-refresh restarted the agent" "$out"
 assert_contains "mode gate reported" "dropped by the mode gate" "$out"
 
+echo "=== scenario 7b: a rejected setpoint is an ERROR ==="
+# The clamp refusing a setpoint means that dispatch was not delivered at all.
+reset
+say "2026-07-26 10:00:00 INFO qw_agent.actuators: actuator ['/data/qw_grid_setpoint.sh', '25000'] -> REJECT: 25000 W (import over 15000)"
+out=$(run)
+assert_contains "rejection reported" "dispatch was NOT delivered" "$out"
+reset
+say "2026-07-26 10:00:00 INFO qw_agent.actuators: actuator -> REJECT: 25000 W (import over 15000)"
+assert_eq "exit 1 on rejection" "1" "$(run_rc)"
+
 echo "=== scenario 8: a missing log is not an error ==="
 reset
 rm -f "$LOGDIR/current"
