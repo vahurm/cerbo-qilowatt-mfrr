@@ -21,7 +21,11 @@ charges.
    (both default 15000). Set them to your site's grid-connection import capacity
    and feed-in (export) cap respectively.
 2. **Atomic DESS save/restore** — `qw_dess_toggle.sh` saves the original DESS Mode
-   before turning it off and restores exactly that value.
+   before turning it off and restores exactly that value. The same save/restore
+   covers the ESS minimum-SOC floor when `QW_MFRR_MIN_SOC` is set, with two
+   guards: the floor is only ever lowered, never raised, and it is only restored
+   if it still holds the value the script installed — so a floor change made in
+   VRM during an event is kept rather than silently reverted.
 3. **Watchdog** — `qw_dess_watchdog.sh`, run every minute, forces DESS back on if it
    has been off longer than `QW_MAX_OFF_SECS` (default 7800 s). This protects against
    a crashed agent leaving DESS off forever.
@@ -48,6 +52,24 @@ charges.
    grep -c FAILSAFE /var/log/qw-agent/current /var/log/qw-agent/@*.s
    ```
 
+5. **Connection watchdogs** — `ConnectionWatchdog` exits (so the supervisor restarts
+   the agent with a fresh session) on three separate signs of deafness: the link
+   reported down past `QW_LINK_RESTART_S`, the transport connected while the command
+   topic stays unsubscribed past `QW_SUBSCRIBE_GRACE_S`, and no command at all for
+   `QW_IDLE_REFRESH_S` while IDLE. The first two are cheap and reliable; the third
+   is a last resort and the only one that can misfire.
+
+   Size `QW_IDLE_REFRESH_S` above the site's longest genuine command silence, and
+   note that setting it too low destroys the evidence needed to correct it: the
+   portal pushes a snapshot ~20 s after every reconnect, so each refresh
+   manufactures a command that resets the timer and the loop sustains itself.
+   Kirdalu restarted every 6 h for weeks this way — 49 of 70 restarts — while its
+   measured median gap simply mirrored the setting. Measure it instead of guessing:
+
+   ```sh
+   python3 /data/qw-agent/afrr_probe.py --log /data/afrr-workmode.log
+   ```
+
 ## Operator responsibilities
 
 - **Set `QW_MAX_IMPORT_W` / `QW_MAX_EXPORT_W` correctly** for the physical
@@ -59,6 +81,10 @@ charges.
 - **Dry-run first** (`QW_DRY_RUN=1`) and start with small values before going live.
 - **Keep the watchdog running** at all times (boot loop). It is the last line of
   defence.
+- **Check that the two-level SOC floor actually engages** if you set
+  `QW_MFRR_MIN_SOC`: it must be below the dashboard's Minimum SOC slider, and the
+  log says `Lowered SOC floor X% -> Y%` when it works and `nothing to lower` when
+  it does not.
 - **Never run two orchestrators at once** (e.g. an old HA automation, the agent's
   state machine, and a Node-RED actuator flow) — they write the same dbus paths and
   will race.
