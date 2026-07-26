@@ -127,12 +127,17 @@ class Config:
         # command is received for this long while IDLE, exit for a fresh
         # subscription. A received command (incl. periodic NORMAL heartbeats)
         # proves the subscription is live, so a site that keeps getting commands
-        # never restarts; only genuine command-silence triggers a refresh. Must be
-        # comfortably larger than the longest expected gap between commands. An
+        # never restarts; only genuine command-silence triggers a refresh. An
         # in-process reconnect cannot help — qilowatt-py starts its telemetry
         # timers exactly once — so a clean process restart is the only safe
         # refresh. 0 disables.
-        self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "21600"))
+        #
+        # 48 h clears both measured maxima (25.7 h and >= 31.9 h, 2026-07) with
+        # room to spare. The previous 6 h default was below both, and because a
+        # restart elicits a post-connect snapshot that resets this timer, the
+        # loop it caused also hid the real gaps from measurement. Do not lower
+        # this without measuring the site first — see docs/SAFETY.md.
+        self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "172800"))
         # Venus OS starts this service before the network is reliably up, so the
         # first DNS resolve can fail; retry briefly instead of dying on a
         # traceback. The supervisor stays the final backstop once these run out.

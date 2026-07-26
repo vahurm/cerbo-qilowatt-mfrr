@@ -64,7 +64,9 @@ charges.
    portal pushes a snapshot ~20 s after every reconnect, so each refresh
    manufactures a command that resets the timer and the loop sustains itself.
    Kirdalu restarted every 6 h for weeks this way — 49 of 70 restarts — while its
-   measured median gap simply mirrored the setting. Measure it instead of guessing:
+   measured median gap simply mirrored the setting. The default is now 48 h, which
+   clears both measured maxima (25.7 h and at least 31.9 h). Measure your own site
+   rather than guessing, and treat a lower value as needing evidence:
 
    ```sh
    python3 /data/qw-agent/afrr_probe.py --log /data/afrr-workmode.log

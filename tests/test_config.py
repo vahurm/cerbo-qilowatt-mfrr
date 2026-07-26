@@ -99,7 +99,7 @@ def test_config_defaults(monkeypatch):
     assert cfg.local_bridge is False
     assert cfg.link_restart_s == 600.0
     assert cfg.subscribe_grace_s == 120.0
-    assert cfg.idle_refresh_s == 21600.0
+    assert cfg.idle_refresh_s == 172800.0
     assert cfg.connect_attempts == 5
     assert cfg.connect_retry_s == 5.0
     assert cfg.mqtt_lost_failsafe_s == 300.0
@@ -129,6 +129,32 @@ def test_max_event_cap_stays_below_the_dess_watchdog_backstop():
     watchdog_default = float(m.group(1))
     agent_default = 7200.0
     assert agent_default < watchdog_default
+
+
+def test_idle_refresh_default_clears_the_measured_command_silence(monkeypatch):
+    """The idle-refresh backstop must not fire during genuine market quiet.
+
+    A restart makes the portal push a snapshot ~20 s later, which resets this
+    timer — so a default below a site's real gaps both restarts for nothing and
+    erases the evidence needed to correct it. Kirdalu ran that loop for weeks at
+    the old 6 h default: 49 of its 70 starts were this watchdog, and its measured
+    median gap came out as the setting itself.
+
+    These are measured maxima (2026-07, tools/afrr_probe.py over the durable
+    WORKMODE capture), not estimates. Kirdalu's is a lower bound, because the
+    restart loop truncated every gap it did not cause.
+    """
+    measured_max_h = {"Kungla": 25.7, "Kirdalu": 31.9}
+
+    _set_environ(monkeypatch, dict(REQUIRED))
+    default_h = qw_agent.Config().idle_refresh_s / 3600.0
+
+    worst = max(measured_max_h.values())
+    assert default_h > worst
+    assert default_h - worst >= 12.0, (
+        f"only {default_h - worst:.1f}h of headroom over the longest measured "
+        "silence; too little for a lower bound"
+    )
 
 
 def test_config_overrides(monkeypatch):
