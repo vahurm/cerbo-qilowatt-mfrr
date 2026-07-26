@@ -10,11 +10,16 @@ Qilowatt mFRR with no Node-RED and no Home Assistant.
 
 State diagram:
 
-    IDLE  --(_source in fusebox/kratt)-->  ACTIVE
-      ^                                       |
-      |  setpoint 0 + DESS on                 |  DESS off, then signed setpoint
-      +---------------------------------------+
-         (_source normal | mqtt_lost>5min | event>30min)
+    IDLE  --(_source in mfrr_sources AND Mode in frrup/frrdown)-->  ACTIVE
+      ^                                                               |
+      |  setpoint 0 + DESS on                 DESS off, then signed setpoint
+      +---------------------------------------------------------------+
+         (non-FRR source or Mode | mqtt_lost>5min | event>30min)
+
+Both gates matter. A single `_source` speaks several dialects: the `qilowatt`
+source sends `frrup`/`frrdown` balancing dispatch *and* `buy` optimiser trades.
+Without the mode gate a `buy` would fall through the `-abs() if frrup else
+abs()` sign rule and be actuated as a full-power grid import with DESS off.
 
 Sign convention: frrup (export) -> negative setpoint; frrdown (import) ->
 positive setpoint. PowerLimit is always reported as a positive magnitude.
@@ -33,12 +38,18 @@ _logger = logging.getLogger("qw_agent.mfrr")
 
 DEFAULT_MFRR_SOURCES = ("fusebox", "kratt")
 
+# The only Modes that carry a balancing setpoint. Deliberately not
+# env-configurable: it is the hard guard that keeps a non-FRR Mode from a
+# trusted source (e.g. `qilowatt` + `buy`) out of the actuators.
+FRR_MODES = ("frrup", "frrdown")
+
 
 class MfrrController:
     def __init__(
         self,
         actuator,
         mfrr_sources: Iterable[str] = DEFAULT_MFRR_SOURCES,
+        frr_modes: Iterable[str] = FRR_MODES,
         mqtt_lost_failsafe_s: float = 300.0,
         max_duration_s: float = 1800.0,
         dess_off_delay_s: float = 2.0,
@@ -46,6 +57,7 @@ class MfrrController:
     ) -> None:
         self._act = actuator
         self._sources = tuple(s.strip().lower() for s in mfrr_sources)
+        self._modes = tuple(m.strip().lower() for m in frr_modes)
         self._mqtt_lost_failsafe_s = mqtt_lost_failsafe_s
         self._max_duration_s = max_duration_s
         self._dess_off_delay_s = dess_off_delay_s
@@ -77,8 +89,16 @@ class MfrrController:
         except (TypeError, ValueError):
             power = 0
 
-        is_mfrr = source in self._sources
+        is_mfrr = source in self._sources and mode in self._modes
         signed = -abs(power) if mode == "frrup" else abs(power)
+
+        if source in self._sources and not is_mfrr:
+            _logger.info(
+                "ignoring non-FRR Mode %r from mFRR source %r (PowerLimit=%s)",
+                mode,
+                source,
+                power,
+            )
 
         with self._lock:
             self._apply(is_mfrr, signed)
