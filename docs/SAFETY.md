@@ -23,14 +23,30 @@ charges.
 2. **Atomic DESS save/restore** — `qw_dess_toggle.sh` saves the original DESS Mode
    before turning it off and restores exactly that value.
 3. **Watchdog** — `qw_dess_watchdog.sh`, run every minute, forces DESS back on if it
-   has been off longer than `QW_MAX_OFF_SECS` (default 1800 s). This protects against
+   has been off longer than `QW_MAX_OFF_SECS` (default 7800 s). This protects against
    a crashed agent leaving DESS off forever.
 4. **State-machine failsafes** — the agent's Python state machine
    (`mfrr_statemachine.py`) releases the setpoint and restores DESS if the Qilowatt
    connection is lost for `QW_MQTT_LOST_FAILSAFE_S` (default 5 min) or an event runs
-   longer than `QW_MAX_EVENT_S` (default 30 min). On a clean stop the agent also
+   longer than `QW_MAX_EVENT_S` (default 2 h). On a clean stop the agent also
    reverts any active event. (The optional Node-RED flow carries an equivalent
    failsafe.)
+
+   These two limits are a pair and the ordering matters: the agent's cap must stay
+   **below** the watchdog's, so the agent is always the one that ends an event —
+   releasing the grid setpoint first, then restoring DESS and the SOC floor. If the
+   watchdog fires first, DESS and the arbitrage floor come back while the agent
+   still holds the setpoint and believes the event is running.
+
+   Size `QW_MAX_EVENT_S` from your own logs rather than intuition. Both defaults
+   were originally 1800 s, which real dispatch outgrew: across 179 Kungla events
+   (2026-07-04 .. 07-26) the median was 620 s but 11 ran longer than 1800 s, the
+   longest 6292 s, and the failsafe truncated 10 live events mid-delivery. To
+   audit your own site:
+
+   ```sh
+   grep -c FAILSAFE /var/log/qw-agent/current /var/log/qw-agent/@*.s
+   ```
 
 ## Operator responsibilities
 

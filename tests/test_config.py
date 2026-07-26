@@ -98,6 +98,33 @@ def test_config_defaults(monkeypatch):
     assert cfg.dry_run is False
     assert cfg.local_bridge is False
     assert cfg.link_restart_s == 600.0
+    assert cfg.mqtt_lost_failsafe_s == 300.0
+    assert cfg.max_event_s == 7200.0
+
+
+def test_max_event_cap_stays_below_the_dess_watchdog_backstop():
+    """The agent must always be the one that ends an event.
+
+    qw_dess_watchdog.sh restores DESS (and the SOC floor) without touching the
+    grid setpoint, so if it fires first the two failsafes disagree: arbitrage is
+    back while mFRR still holds the inverter. Read the shell default straight
+    from the script so the two cannot drift apart unnoticed.
+    """
+    import os
+    import re
+
+    script = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "scripts",
+        "qw_dess_watchdog.sh",
+    )
+    with open(script, encoding="utf-8") as fh:
+        m = re.search(r'MAX_OFF_SECS="\$\{QW_MAX_OFF_SECS:-(\d+)\}"', fh.read())
+    assert m, "could not read QW_MAX_OFF_SECS default from qw_dess_watchdog.sh"
+
+    watchdog_default = float(m.group(1))
+    agent_default = 7200.0
+    assert agent_default < watchdog_default
 
 
 def test_config_overrides(monkeypatch):

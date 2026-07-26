@@ -94,7 +94,17 @@ class Config:
             if s.strip()
         )
         self.mqtt_lost_failsafe_s = float(os.environ.get("QW_MQTT_LOST_FAILSAFE_S", "300"))
-        self.max_event_s = float(os.environ.get("QW_MAX_EVENT_S", "1800"))
+        # Cap on a single mFRR event. Guards the case the link stays up but the
+        # return-to-normal command never arrives; the shorter link-loss and
+        # subscribe watchdogs cover the other deaf-session modes.
+        #
+        # 1800 s was too low for real dispatch: over 179 Kungla events (2026-07-04
+        # .. 07-26) the median was 620 s but 11 ran longer than 1800 s and the
+        # longest was 6292 s, so the failsafe truncated 10 live events mid-delivery.
+        # MUST stay below qw_dess_watchdog.sh's QW_MAX_OFF_SECS, otherwise that
+        # watchdog restores DESS (and the SOC floor) while the agent still holds
+        # the grid setpoint and believes the event is running.
+        self.max_event_s = float(os.environ.get("QW_MAX_EVENT_S", "7200"))
         self.dess_off_delay_s = float(os.environ.get("QW_DESS_OFF_DELAY_S", "2"))
         self.tick_interval_s = float(os.environ.get("QW_TICK_INTERVAL_S", "10"))
         # Liveness watchdog: if the QW cloud link stays down this long, exit so
