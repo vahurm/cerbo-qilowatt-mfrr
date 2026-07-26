@@ -37,8 +37,10 @@ python3 -m pip install --quiet --target "$BUILD_LIB" -r "$REPO_DIR/agent/require
 echo "==> Installing actuator scripts to /data"
 scp_ "$REPO_DIR"/scripts/qw_dess_toggle.sh \
      "$REPO_DIR"/scripts/qw_grid_setpoint.sh \
-     "$REPO_DIR"/scripts/qw_dess_watchdog.sh "$CERBO_HOST":/data/
-ssh_ 'chmod 750 /data/qw_dess_toggle.sh /data/qw_grid_setpoint.sh /data/qw_dess_watchdog.sh'
+     "$REPO_DIR"/scripts/qw_dess_watchdog.sh \
+     "$REPO_DIR"/scripts/qw_log_audit.sh "$CERBO_HOST":/data/
+ssh_ 'chmod 750 /data/qw_dess_toggle.sh /data/qw_grid_setpoint.sh \
+      /data/qw_dess_watchdog.sh /data/qw_log_audit.sh'
 
 # --- 3. Agent + vendored libs -> /data/qw-agent ----------------------------
 echo "==> Installing agent to /data/qw-agent"
@@ -51,9 +53,10 @@ scp_ -r "$BUILD_LIB"/. "$CERBO_HOST":/data/qw-agent/pylib/
 
 # --- 3b. Read-only diagnostics (aFRR verification) -------------------------
 # afrr_probe.py classifies the WORKMODE stream; afrr_capture.sh is a durable,
-# read-only WORKMODE tap. Neither touches dbus or the actuators. Capture is NOT
-# auto-started here — run `/data/afrr_capture.sh start` when verifying (see
-# docs/AFRR_VERIFICATION.md).
+# read-only WORKMODE tap. Neither touches dbus or the actuators. The capture is
+# started from rc.local (step 6) because the log ring only holds ~2 weeks, which
+# is too short to size QW_IDLE_REFRESH_S on a low-traffic site — see
+# docs/AFRR_VERIFICATION.md.
 echo "==> Installing read-only diagnostics (afrr_probe.py, afrr_capture.sh)"
 scp_ "$REPO_DIR"/tools/afrr_probe.py "$CERBO_HOST":/data/qw-agent/afrr_probe.py
 scp_ "$REPO_DIR"/tools/afrr_capture.sh "$CERBO_HOST":/data/afrr_capture.sh
@@ -126,6 +129,38 @@ fi
 if ! ps | grep -v grep | grep -q qw_dess_watchdog; then
   nohup sh -c 'while true; do /data/qw_dess_watchdog.sh; sleep 60; done' >/dev/null 2>&1 &
   echo "   started watchdog loop"
+fi
+
+# (c) durable WORKMODE capture — the log ring is too short to size the
+#     idle-refresh watchdog on a site that gets few commands
+if ! grep -q 'afrr_capture.sh start' "$RC"; then
+  cat >> "$RC" <<'EOF'
+
+# aFRR WORKMODE capture (verification) — durable, read-only tap
+[ -x /data/afrr_capture.sh ] && /data/afrr_capture.sh start
+EOF
+  echo "   added WORKMODE capture autostart"
+else
+  echo "   WORKMODE capture autostart already present"
+fi
+if [ -x /data/afrr_capture.sh ]; then
+  /data/afrr_capture.sh start >/dev/null 2>&1 || true
+fi
+
+# (d) hourly log audit — every defect so far was visible in the log and missed
+if ! grep -q qw_log_audit "$RC"; then
+  cat >> "$RC" <<'EOF'
+
+# QW log audit — reports new FAILSAFE / crash / watchdog / SOC-floor symptoms
+( while true; do /data/qw_log_audit.sh >/dev/null 2>&1; sleep 3600; done ) &
+EOF
+  echo "   added log audit loop"
+else
+  echo "   log audit loop already present"
+fi
+if ! ps | grep -v grep | grep -q qw_log_audit; then
+  nohup sh -c 'while true; do /data/qw_log_audit.sh >/dev/null 2>&1; sleep 3600; done' >/dev/null 2>&1 &
+  echo "   started log audit loop"
 fi
 REMOTE
 
