@@ -204,6 +204,14 @@ def _loads_dict(text: str) -> Optional[dict]:
 # Classification
 # --------------------------------------------------------------------------- #
 
+# Thresholds (hours) for the command-silence histogram. These bracket the
+# QW_IDLE_REFRESH_S candidates: that watchdog restarts the agent after this much
+# command silence, so a site whose genuine gaps exceed the setting restarts for
+# nothing — and because a restart itself elicits a post-connect snapshot, the
+# resulting command then masks how long the real silence would have been.
+SILENCE_BUCKETS_H = (6, 12, 24, 30, 36, 48, 72)
+
+
 @dataclass
 class StreamVerdict:
     total: int = 0
@@ -216,6 +224,11 @@ class StreamVerdict:
     unknown_modes: set = field(default_factory=set)
     frr_median_interval_s: Optional[float] = None
     frr_power_changes: int = 0
+    window_s: Optional[float] = None
+    commands_per_day: Optional[float] = None
+    silence_median_s: Optional[float] = None
+    silence_max_s: Optional[float] = None
+    silences_over_h: Dict[int, int] = field(default_factory=dict)
     fingerprint: str = "inconclusive"
     decision: str = "INCONCLUSIVE"
     rationale: str = ""
@@ -286,6 +299,22 @@ def classify_stream(
                 v.frr_power_changes += 1
             last_power = r.power
 
+    # Command-silence distribution over ALL commands, not just FRR ones: the
+    # idle-refresh watchdog is satisfied by any WORKMODE, so this is what bounds
+    # a safe QW_IDLE_REFRESH_S.
+    all_ts = sorted(r.ts for r in records if r.ts is not None)
+    if len(all_ts) >= 2:
+        v.window_s = all_ts[-1] - all_ts[0]
+        if v.window_s > 0:
+            v.commands_per_day = len(all_ts) * 86400.0 / v.window_s
+        gaps = [b - a for a, b in zip(all_ts, all_ts[1:]) if b - a >= 0]
+        if gaps:
+            v.silence_median_s = _median(gaps)
+            v.silence_max_s = max(gaps)
+            v.silences_over_h = {
+                h: sum(1 for g in gaps if g >= h * 3600.0) for h in SILENCE_BUCKETS_H
+            }
+
     # Fingerprint. Continuous modulation dominates; then unknown signals; then
     # plain block mFRR; else inconclusive.
     continuous = (
@@ -334,6 +363,24 @@ def render_summary(v: StreamVerdict) -> str:
         f"  unknown sources      : {', '.join(sorted(v.unknown_sources)) or '(none)'}",
         f"  unknown modes        : {', '.join(sorted(v.unknown_modes)) or '(none)'}",
         f"  extra WORKMODE keys  : {', '.join(sorted(v.extras_keys)) or '(none)'}",
+    ]
+    if v.silence_max_s is not None:
+        per_day = (
+            f"{v.commands_per_day:.1f}/day" if v.commands_per_day is not None else "n/a"
+        )
+        window = f"{v.window_s / 86400.0:.1f} d" if v.window_s is not None else "n/a"
+        lines.extend([
+            "-" * 68,
+            "  command silence (bounds a safe QW_IDLE_REFRESH_S)",
+            f"    window             : {window} ({per_day})",
+            f"    median gap         : {v.silence_median_s:.0f}s",
+            f"    longest silence    : {v.silence_max_s / 3600.0:.1f}h",
+            "    silences >=        : "
+            + ", ".join(f"{h}h:{n}" for h, n in v.silences_over_h.items()),
+            f"    => QW_IDLE_REFRESH_S must stay above {v.silence_max_s / 3600.0:.1f}h "
+            "or the agent restarts during genuine quiet periods",
+        ])
+    lines += [
         "-" * 68,
         f"  FINGERPRINT          : {v.fingerprint}",
         f"  DECISION             : {v.decision}",
