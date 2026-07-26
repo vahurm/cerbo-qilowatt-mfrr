@@ -113,3 +113,54 @@ def test_render_summary_contains_decision():
     out = ap.render_summary(v)
     assert "DECISION" in out
     assert "UNAFFECTED" in out
+
+
+# --------------------------------------------------------------------------- #
+# Command silence (bounds a safe QW_IDLE_REFRESH_S)
+# --------------------------------------------------------------------------- #
+
+HOUR = 3600.0
+
+
+def test_command_silence_counts_every_source_not_just_frr():
+    # The idle-refresh watchdog is satisfied by ANY command, so a notimer
+    # heartbeat must count towards closing a gap exactly like an FRR dispatch.
+    recs = [
+        ap.Record(source="notimer", mode="normal", power=0, ts=0.0),
+        ap.Record(source="notimer", mode="normal", power=0, ts=60.0),
+        _frr(60.0 + 31 * HOUR, 3000),
+    ]
+    v = ap.classify_stream(recs)
+    assert v.silence_max_s == 31 * HOUR
+    assert v.silence_median_s == (60.0 + 31 * HOUR) / 2.0
+    assert v.silences_over_h[24] == 1
+    assert v.silences_over_h[30] == 1
+    assert v.silences_over_h[36] == 0
+
+
+def test_command_silence_window_and_rate():
+    recs = [
+        ap.Record(source="notimer", mode="normal", power=0, ts=t * 24 * HOUR)
+        for t in range(3)
+    ]
+    v = ap.classify_stream(recs)
+    assert v.window_s == 2 * 24 * HOUR
+    assert v.commands_per_day == 1.5  # 3 commands across a 2-day window
+
+
+def test_command_silence_absent_for_a_single_command():
+    v = ap.classify_stream([_frr(0.0, 3000)])
+    assert v.silence_max_s is None
+    assert v.silences_over_h == {}
+    assert "command silence" not in ap.render_summary(v)
+
+
+def test_render_summary_reports_the_idle_refresh_bound():
+    recs = [
+        ap.Record(source="notimer", mode="normal", power=0, ts=0.0),
+        ap.Record(source="notimer", mode="normal", power=0, ts=31 * HOUR),
+    ]
+    out = ap.render_summary(ap.classify_stream(recs))
+    assert "command silence" in out
+    assert "31.0h" in out
+    assert "QW_IDLE_REFRESH_S" in out
