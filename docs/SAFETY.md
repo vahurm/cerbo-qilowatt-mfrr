@@ -70,6 +70,18 @@ charges.
    python3 /data/qw-agent/afrr_probe.py --log /data/afrr-workmode.log
    ```
 
+   If you disable this backstop (`QW_IDLE_REFRESH_S=0`) to measure a site's real
+   silence, note that nothing then restarts a deaf session. `qw_log_audit.sh`
+   compensates by *reporting* command silence past `QW_HEALTH_MAX_SILENCE_H`
+   (36 h) without restarting anything, so the site is still observable.
+
+6. **Log audit** — `qw_log_audit.sh`, run hourly from the boot loop, reports new
+   crashes, failsafe firings, watchdog restarts, dropped commands and a SOC floor
+   that failed to engage, to stdout and syslog (tag `qw_health`), exiting non-zero
+   on any finding. It examines only lines added since its previous run, so a
+   one-off event is reported once. Every defect this project has hit was visible
+   in the log for weeks before anyone noticed, which is what this exists to fix.
+
 ## Operator responsibilities
 
 - **Set `QW_MAX_IMPORT_W` / `QW_MAX_EXPORT_W` correctly** for the physical
