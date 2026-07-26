@@ -229,6 +229,61 @@ def test_source_and_mode_are_case_insensitive(actuator, clock, timers, make_comm
 
 
 # --------------------------------------------------------------------------- #
+# Mode gate: a trusted source may also speak non-FRR dialects
+#
+# Live evidence (Kirdalu + Kungla, 2026-07): `_source='qilowatt'` sends both
+# frrup/frrdown balancing dispatch and `buy` optimiser trades on the same
+# topic. Without the mode gate a `buy` is signed `+abs(PowerLimit)` and lands
+# in the actuators as a full-power grid import with DESS disabled.
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("mode", ["buy", "sell", "normal", "", "surprise"])
+def test_non_frr_mode_from_mfrr_source_is_ignored(
+    actuator, clock, timers, make_command, mode
+):
+    ctrl = make_controller(actuator, mfrr_sources=("fusebox", "kratt", "qilowatt"))
+    ctrl.on_workmode(make_command(source="qilowatt", mode=mode, power=10000))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls == []
+
+
+def test_buy_during_active_event_reverts_instead_of_setting_import(
+    actuator, clock, timers, make_command
+):
+    ctrl = make_controller(actuator, mfrr_sources=("fusebox", "kratt", "qilowatt"))
+    ctrl.on_workmode(make_command(source="qilowatt", mode="frrup", power=10000))
+    timers.fire_pending()
+    assert actuator.setpoints == [-10000]
+
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=10000))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls[-2:] == [("set_setpoint", 0), ("dess_on",)]
+    assert 10000 not in actuator.setpoints
+
+
+@pytest.mark.parametrize(
+    "mode,expected", [("frrup", -10000), ("frrdown", 11000)]
+)
+def test_qilowatt_source_frr_is_actuated_once_enabled(
+    actuator, clock, timers, make_command, mode, expected
+):
+    ctrl = make_controller(actuator, mfrr_sources=("fusebox", "kratt", "qilowatt"))
+    ctrl.on_workmode(make_command(source="qilowatt", mode=mode, power=abs(expected)))
+    timers.fire_pending()
+    assert ctrl.state == "ACTIVE"
+    assert actuator.setpoints == [expected]
+
+
+def test_qilowatt_source_stays_ignored_when_not_configured(
+    actuator, clock, timers, make_command
+):
+    ctrl = make_controller(actuator)  # default sources: fusebox, kratt
+    ctrl.on_workmode(make_command(source="qilowatt", mode="frrup", power=10000))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls == []
+
+
+# --------------------------------------------------------------------------- #
 # State-change hook (local-bridge / Node-RED coexistence)
 # --------------------------------------------------------------------------- #
 

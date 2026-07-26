@@ -52,8 +52,11 @@ from typing import Dict, List, Optional
 # What the agent knows about (mirrors mfrr_statemachine + qilowatt-py models)
 # --------------------------------------------------------------------------- #
 
-# Sources the state machine treats as an active mFRR event.
-MFRR_SOURCES = {"fusebox", "kratt"}
+# Sources the state machine treats as an active mFRR event. "qilowatt" is the
+# vendor's own trading desk: it dispatches frrup/frrdown (the only balancing
+# channel Kirdalu/Kaasiku is on) but also sends Mode=buy optimiser trades, which
+# the state machine's mode gate drops.
+MFRR_SOURCES = {"fusebox", "kratt", "qilowatt"}
 # Non-mFRR sources the agent ignores. Documented by qilowatt-ha (timer,
 # optimizer, manual) plus values observed live on the Kungla cloud stream
 # ("notimer" = the idle/return-to-normal command after an event).
