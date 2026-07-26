@@ -105,6 +105,8 @@ report ERROR "$(count 'FAILSAFE')" \
   "failsafe reverted an event — it either ran past QW_MAX_EVENT_S or lost the QW link mid-delivery"
 report ERROR "$(count 'subscription dead')" \
   "zombie subscription: transport was connected but the command topic was not"
+report ERROR "$(count 'REJECT')" \
+  "setpoint rejected by the clamp — dispatch was NOT delivered; check QW_MAX_IMPORT_W / QW_MAX_EXPORT_W against what the market actually sends"
 report WARN "$(count 'nothing to lower')" \
   "two-level SOC floor did not engage — QW_MFRR_MIN_SOC must be BELOW the dashboard Minimum SOC"
 report WARN "$(count 'no WORKMODE command received')" \
