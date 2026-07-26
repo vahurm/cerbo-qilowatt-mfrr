@@ -10,14 +10,20 @@
 # layer (Node-RED / the agent) crashes or the network drops mid-event, DESS
 # would otherwise stay off forever.
 #
+# This is the OUTER backstop and must stay above the agent's QW_MAX_EVENT_S
+# (default 7200 s), which ends events cleanly by releasing the setpoint first.
+# If this fires while the agent still believes an event is running, DESS and the
+# SOC floor come back while the grid setpoint is still held — a conflicting state
+# where arbitrage and mFRR fight over the same inverter.
+#
 # Env overrides:
-#   QW_MAX_OFF_SECS   (default 1800)  — max seconds DESS may stay off
+#   QW_MAX_OFF_SECS   (default 7800)  — max seconds DESS may stay off
 #   QW_TOGGLE_SCRIPT  (default /data/qw_dess_toggle.sh)
 # =============================================================================
 
 OFF_AT_FILE="/tmp/qw_dess_off_at"
 TOGGLE_SCRIPT="${QW_TOGGLE_SCRIPT:-/data/qw_dess_toggle.sh}"
-MAX_OFF_SECS="${QW_MAX_OFF_SECS:-1800}"   # 30 minutes; one mFRR event must not exceed this
+MAX_OFF_SECS="${QW_MAX_OFF_SECS:-7800}"   # 2 h 10 min; 10 min above the agent's cap
 LOG_TAG="qw_dess_wd"
 
 [ -f "$OFF_AT_FILE" ] || exit 0
