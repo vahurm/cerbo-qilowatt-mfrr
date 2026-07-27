@@ -12,6 +12,7 @@
 #   * "ignoring non-FRR Mode"  — commands arriving and being dropped
 #   * "nothing to lower"       — the two-level SOC floor never engaging (Y >= X)
 #   * "FAILSAFE"               — an event truncated mid-delivery
+#   * a foreign mFRR END       — a third party writing our WorkMode channel
 #   * "no WORKMODE command"    — idle-refresh restarting the agent in a loop
 #   * "subscription dead"      — the zombie-subscription watchdog firing
 #   * "Traceback"              — the agent crashing and being restarted
@@ -117,6 +118,29 @@ report WARN "$(count 'ignoring non-FRR Mode')" \
   "commands from a trusted source were dropped by the mode gate (expected for Mode=buy)"
 report WARN "$(count 'QW connect attempt')" \
   "initial QW connect failed and was retried (usually DNS not ready at boot)"
+
+# --- who ended our events -------------------------------------------------- #
+# An event should end because the dispatcher stood down (a 0 W FRR command),
+# because the portal returned the site to normal, or because a failsafe fired
+# (already reported above). Anything else is a third party writing the same
+# WorkMode channel and cutting delivery short — which is exactly how Qilowatt's
+# Energy Optimizer truncated every event on both sites on 2026-07-27 while
+# looking, in the log, like a perfectly ordinary end of dispatch.
+if [ -n "$window" ]; then
+  # Only an FRR Mode at 0 W is a stand-down. A *non*-FRR Mode at 0 W is not
+  # exempt: that is precisely what the Optimizer's limitexport/savebattery
+  # looked like.
+  foreign=$(printf '%s\n' "$window" \
+    | grep 'mFRR END (' \
+    | grep -v 'mFRR END (notimer/' \
+    | grep -v '/frrup 0 W)' \
+    | grep -v '/frrdown 0 W)' \
+    | grep -v 'failsafe' \
+    | grep -v 'agent shutdown' \
+    | grep -c . 2>/dev/null || true)
+  report WARN "$foreign" \
+    "an mFRR event was ended by a foreign automation writing the same WorkMode channel — grep 'mFRR END' to see which one"
+fi
 
 restarts=$(count 'Starting qw_agent')
 if [ "$restarts" -gt "$MAX_RESTARTS" ]; then
