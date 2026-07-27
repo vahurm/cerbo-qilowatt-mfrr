@@ -47,8 +47,8 @@ Uses the official [`qilowatt-py`](https://github.com/qilowatt/qilowatt-py)
 | WorkModeCommand | Local topic        | Used by state machine for |
 |-----------------|--------------------|---------------------------|
 | `_source`       | `qw/qw_source`     | IDLE↔ACTIVE trigger (`fusebox`/`kratt`) |
-| `Mode`          | `qw/qw_mode`       | setpoint sign (`frrup` = export) |
-| `PowerLimit`    | `qw/qw_powerlimit` | setpoint magnitude (W) |
+| `Mode`          | `qw/qw_mode`       | setpoint sign (`frrup` = export) and the mode gate |
+| `PowerLimit`    | `qw/qw_powerlimit` | setpoint magnitude (W); zero ends the event |
 | connection      | `qw/qw_connected`  | `mqtt_lost` failsafe |
 
 ### Node-RED state machine
@@ -58,6 +58,10 @@ setpoint. `ACTIVE → ACTIVE` on power change: rewrite setpoint. `ACTIVE → IDL
 the source clears: setpoint 0 + DESS on. Failsafes: connection lost > 5 min, or
 event > 30 min → release. It also maintains a `global.qw_mfrr` flag for a
 co-resident curtailment flow (see [`../nodered/curtailment-mfrr-aware.md`](../nodered/curtailment-mfrr-aware.md)).
+
+The flow predates the Python agent's mode and power gates and does not mirror
+them, so it will hold a zero-power FRR command as a 0 W event. Both live sites
+run the Python agent; treat the flow as the older, coarser implementation.
 
 ### Actuators
 

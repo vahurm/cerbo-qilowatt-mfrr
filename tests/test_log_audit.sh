@@ -198,6 +198,28 @@ age_capture 99
 out=$(run QW_HEALTH_MAX_SILENCE_H=0)
 assert_missing "disabled by QW_HEALTH_MAX_SILENCE_H=0" "no WORKMODE command for" "$out"
 
+echo "=== scenario 13: a foreign automation ending an event is reported ==="
+# The 2026-07-27 case: Qilowatt's Energy Optimizer wrote the same WorkMode
+# channel as the mFRR dispatcher and cut every event short.
+reset
+say "2026-07-26 10:00:00 INFO qw_agent.mfrr: mFRR END (optimizer/limitexport 0 W): grid setpoint 0, DESS on"
+out=$(run)
+assert_contains "foreign end reported" "foreign automation" "$out"
+reset
+say "2026-07-26 10:00:00 INFO qw_agent.mfrr: mFRR END (optimizer/savebattery 0 W): grid setpoint 0, DESS on"
+assert_eq "exit 1 on foreign end" "1" "$(run_rc)"
+
+echo "=== scenario 14: legitimate event ends stay quiet ==="
+# A stand-down, a portal return-to-normal and a failsafe are all accounted for
+# elsewhere; none of them should look like third-party interference.
+reset
+say "2026-07-26 10:00:00 INFO qw_agent.mfrr: mFRR END (notimer/normal 10000 W): grid setpoint 0, DESS on"
+say "2026-07-26 10:01:00 INFO qw_agent.mfrr: mFRR END (kratt/frrup 0 W): grid setpoint 0, DESS on"
+say "2026-07-26 10:02:00 INFO qw_agent.mfrr: mFRR END (agent shutdown): grid setpoint 0, DESS on"
+say "2026-07-26 10:03:00 INFO qw_agent.mfrr: mFRR END (failsafe: event > 7200s): grid setpoint 0, DESS on"
+out=$(run)
+assert_missing "no foreign-end false alarm" "foreign automation" "$out"
+
 echo "-----------------------------------------"
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]

@@ -52,6 +52,18 @@ charges.
    grep -c FAILSAFE /var/log/qw-agent/current /var/log/qw-agent/@*.s
    ```
 
+   Every event end names its trigger — `mFRR END (kratt/frrup 0 W)`,
+   `mFRR END (failsafe: event > 7200s)` — because an unattributed end cannot be
+   told apart from a failsafe, a stand-down, or a foreign automation, and
+   attributing one after the fact means hand-matching timestamps across two logs.
+
+   **A zero-power `frrup`/`frrdown` ends the event rather than holding 0 W.**
+   It is the dispatcher standing down, and an event held at 0 W keeps DESS off
+   and the SOC floor lowered while delivering nothing. On Kungla these are
+   routine — 121 in 24 days — and before this gate existed, 52 of them stranded
+   the site for a total of 4.4 h (median 4.8 min, worst 12.5 min), every one
+   ending only because an unrelated later command happened to arrive.
+
 5. **Connection watchdogs** — `ConnectionWatchdog` exits (so the supervisor restarts
    the agent with a fresh session) on three separate signs of deafness: the link
    reported down past `QW_LINK_RESTART_S`, the transport connected while the command
@@ -78,11 +90,12 @@ charges.
    (36 h) without restarting anything, so the site is still observable.
 
 6. **Log audit** — `qw_log_audit.sh`, run hourly from the boot loop, reports new
-   crashes, failsafe firings, watchdog restarts, dropped commands and a SOC floor
-   that failed to engage, to stdout and syslog (tag `qw_health`), exiting non-zero
-   on any finding. It examines only lines added since its previous run, so a
-   one-off event is reported once. Every defect this project has hit was visible
-   in the log for weeks before anyone noticed, which is what this exists to fix.
+   crashes, failsafe firings, watchdog restarts, dropped commands, a SOC floor
+   that failed to engage and events ended by a foreign automation, to stdout and
+   syslog (tag `qw_health`), exiting non-zero on any finding. It examines only
+   lines added since its previous run, so a one-off event is reported once. Every
+   defect this project has hit was visible in the log for weeks before anyone
+   noticed, which is what this exists to fix.
 
 ## Operator responsibilities
 
@@ -109,6 +122,15 @@ charges.
 - **Never run two orchestrators at once** (e.g. an old HA automation, the agent's
   state machine, and a Node-RED actuator flow) — they write the same dbus paths and
   will race.
+- **The second orchestrator can be in the vendor's cloud.** On 2026-07-27
+  Qilowatt's Energy Optimizer was enabled on both sites; it writes the same
+  WorkMode channel as the mFRR dispatcher, on 15-minute slot boundaries, and it
+  ended every event on both sites that morning. Its Modes are never actuated
+  here — arbitrage is Victron DESS's job — so it contributed nothing and only
+  truncated delivery. If a site runs DESS for arbitrage, the cloud-side
+  optimiser is redundant by construction. Note the coupling risk before
+  disabling it: the vendor documents the Optimizer as the component that
+  manages mFRR signals, so confirm dispatch survives rather than assuming it.
 
 ## Emergency stop
 

@@ -10,16 +10,27 @@ Qilowatt mFRR with no Node-RED and no Home Assistant.
 
 State diagram:
 
-    IDLE  --(_source in mfrr_sources AND Mode in frrup/frrdown)-->  ACTIVE
-      ^                                                               |
-      |  setpoint 0 + DESS on                 DESS off, then signed setpoint
-      +---------------------------------------------------------------+
-         (non-FRR source or Mode | mqtt_lost>5min | event>max_duration)
+    IDLE  --(_source in mfrr_sources AND Mode in frrup/frrdown AND power != 0)--> ACTIVE
+      ^                                                                            |
+      |  setpoint 0 + DESS on                        DESS off, then signed setpoint
+      +----------------------------------------------------------------------------+
+         (non-FRR source or Mode | zero-power FRR | mqtt_lost>5min | event>max)
 
-Both gates matter. A single `_source` speaks several dialects: the `qilowatt`
-source sends `frrup`/`frrdown` balancing dispatch *and* `buy` optimiser trades.
-Without the mode gate a `buy` would fall through the `-abs() if frrup else
-abs()` sign rule and be actuated as a full-power grid import with DESS off.
+All three gates matter.
+
+The *source* gate keeps strangers out. The *mode* gate matters because a single
+`_source` speaks several dialects: the `qilowatt` source sends `frrup`/`frrdown`
+balancing dispatch *and* `buy` optimiser trades. Without it a `buy` would fall
+through the `-abs() if frrup else abs()` sign rule and be actuated as a
+full-power grid import with DESS off.
+
+The *power* gate exists because a zero-power `frrup`/`frrdown` is the dispatcher's
+routine stand-down, not an instruction to hold 0 W. Held as an event it would
+park DESS off and the SOC floor lowered while delivering nothing, so it ends the
+event instead. Measured on Kungla (2026-07-03..27): 121 zero-power FRR commands
+in 24 days, 52 of which stranded the site — 4.4 h of pointless DESS-off in
+total, median 4.8 min, worst 12.5 min — every one rescued only because some
+unrelated later command happened to arrive and end the event.
 
 Sign convention: frrup (export) -> negative setpoint; frrdown (import) ->
 positive setpoint. PowerLimit is always reported as a positive magnitude.
@@ -89,10 +100,18 @@ class MfrrController:
         except (TypeError, ValueError):
             power = 0
 
-        is_mfrr = source in self._sources and mode in self._modes
+        is_frr = source in self._sources and mode in self._modes
+        # Zero power on an FRR Mode is a stand-down, not a 0 W dispatch to hold.
+        is_mfrr = is_frr and power != 0
         signed = -abs(power) if mode == "frrup" else abs(power)
 
-        if source in self._sources and not is_mfrr:
+        if is_frr and not is_mfrr:
+            _logger.info(
+                "%s Mode %r carries 0 W -> stand-down, not a 0 W dispatch",
+                source,
+                mode,
+            )
+        elif source in self._sources and not is_frr:
             _logger.info(
                 "ignoring non-FRR Mode %r from mFRR source %r (PowerLimit=%s)",
                 mode,
@@ -101,7 +120,7 @@ class MfrrController:
             )
 
         with self._lock:
-            self._apply(is_mfrr, signed)
+            self._apply(is_mfrr, signed, "%s/%s %s W" % (source or "?", mode, power))
 
     def on_connected(self, connected: bool) -> None:
         with self._lock:
@@ -126,7 +145,7 @@ class MfrrController:
                     "FAILSAFE: QW link lost > %ss while ACTIVE -> revert",
                     self._mqtt_lost_failsafe_s,
                 )
-                self._revert()
+                self._revert("failsafe: QW link lost > %ss" % self._mqtt_lost_failsafe_s)
                 return
             if (
                 self._event_start is not None
@@ -135,7 +154,7 @@ class MfrrController:
                 _logger.warning(
                     "FAILSAFE: mFRR event > %ss -> revert", self._max_duration_s
                 )
-                self._revert()
+                self._revert("failsafe: event > %ss" % self._max_duration_s)
 
     def shutdown(self) -> None:
         """On clean stop, revert an active event so the system is left safe."""
@@ -145,7 +164,7 @@ class MfrrController:
                 self._pending_timer = None
             if self._state == "ACTIVE":
                 _logger.info("shutdown during ACTIVE event -> revert to safe")
-                self._revert()
+                self._revert("agent shutdown")
 
     @property
     def state(self) -> str:
@@ -171,7 +190,7 @@ class MfrrController:
     # ------------------------------------------------------------------ #
     # Transitions (call with the lock held)
     # ------------------------------------------------------------------ #
-    def _apply(self, is_mfrr: bool, signed: int) -> None:
+    def _apply(self, is_mfrr: bool, signed: int, reason: str = "") -> None:
         if self._state == "IDLE" and is_mfrr:
             self._enter_active(signed)
         elif self._state == "ACTIVE" and is_mfrr:
@@ -181,7 +200,7 @@ class MfrrController:
                 self._act.set_setpoint(signed)
                 self._notify()
         elif self._state == "ACTIVE" and not is_mfrr:
-            self._revert()
+            self._revert(reason)
 
     def _enter_active(self, signed: int) -> None:
         self._state = "ACTIVE"
@@ -209,7 +228,7 @@ class MfrrController:
             self._pending_timer = None
             self._act.set_setpoint(self._last_signed_watts)
 
-    def _revert(self) -> None:
+    def _revert(self, reason: str = "") -> None:
         self._state = "IDLE"
         self._event_start = None
         self._last_signed_watts = 0
@@ -218,7 +237,12 @@ class MfrrController:
         if self._pending_timer is not None:
             self._pending_timer.cancel()
             self._pending_timer = None
-        _logger.info("mFRR END: grid setpoint 0, DESS on")
+        # Name the trigger: without it an END line cannot be told apart from a
+        # failsafe, a stand-down or a foreign automation writing the same topic,
+        # and attributing one means hand-matching timestamps across two logs.
+        _logger.info(
+            "mFRR END (%s): grid setpoint 0, DESS on", reason or "reason unrecorded"
+        )
         # Release the setpoint before restoring DESS so they don't fight.
         self._act.set_setpoint(0)
         self._act.dess_on()

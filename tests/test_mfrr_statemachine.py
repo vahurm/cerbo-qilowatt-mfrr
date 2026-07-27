@@ -187,12 +187,12 @@ def test_revert_before_delayed_setpoint_cancels_it(
 # Command parsing robustness
 # --------------------------------------------------------------------------- #
 
-def test_power_none_is_treated_as_zero(actuator, clock, timers, make_command):
+def test_power_none_does_not_open_an_event(actuator, clock, timers, make_command):
     ctrl = make_controller(actuator)
     ctrl.on_workmode(make_command(power=None))
     timers.fire_pending()
-    assert ctrl.state == "ACTIVE"
-    assert actuator.setpoints == [0]
+    assert ctrl.state == "IDLE"
+    assert actuator.calls == []
 
 
 def test_power_as_string_is_parsed(actuator, clock, timers, make_command):
@@ -202,13 +202,15 @@ def test_power_as_string_is_parsed(actuator, clock, timers, make_command):
     assert actuator.setpoints == [4000]
 
 
-def test_power_non_numeric_string_falls_back_to_zero(
+def test_power_non_numeric_string_does_not_open_an_event(
     actuator, clock, timers, make_command
 ):
+    """Unparseable power must not drop DESS and lower the SOC floor either."""
     ctrl = make_controller(actuator)
     ctrl.on_workmode(make_command(power="oops"))
     timers.fire_pending()
-    assert actuator.setpoints == [0]
+    assert ctrl.state == "IDLE"
+    assert actuator.calls == []
 
 
 def test_missing_source_is_non_mfrr(actuator, clock, timers):
@@ -320,3 +322,94 @@ def test_on_state_change_faulty_listener_does_not_break_machine(
     assert ctrl.state == "ACTIVE"
     timers.fire_pending()
     assert actuator.setpoints == [3000]
+
+
+# --------------------------------------------------------------------------- #
+# Power gate: a zero-power FRR command is a stand-down, not a 0 W dispatch
+#
+# Live evidence (Kungla, 2026-07-03..27): 121 `kratt`/`frrup` commands carried
+# PowerLimit=0. Held as an event they park DESS off and the SOC floor lowered
+# while delivering nothing; 52 of them stranded the site until an unrelated
+# later command happened to end the event (4.4 h total, worst 12.5 min).
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("mode", ["frrup", "frrdown"])
+def test_zero_power_frr_does_not_open_an_event(
+    actuator, clock, timers, make_command, mode
+):
+    ctrl = make_controller(actuator)
+    ctrl.on_workmode(make_command(source="kratt", mode=mode, power=0))
+    timers.fire_pending()
+    assert ctrl.state == "IDLE"
+    # Crucially no dess_off: DESS keeps doing arbitrage.
+    assert actuator.calls == []
+
+
+@pytest.mark.parametrize("mode", ["frrup", "frrdown"])
+def test_zero_power_frr_ends_an_active_event(
+    actuator, clock, timers, make_command, mode
+):
+    ctrl = make_controller(actuator)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=5000))
+    timers.fire_pending()
+    assert ctrl.state == "ACTIVE"
+
+    ctrl.on_workmode(make_command(source="kratt", mode=mode, power=0))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls[-2:] == [("set_setpoint", 0), ("dess_on",)]
+
+
+def test_stand_down_then_new_dispatch_starts_a_fresh_event(
+    actuator, clock, timers, make_command
+):
+    ctrl = make_controller(actuator)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=5000))
+    timers.fire_pending()
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=0))
+    assert ctrl.state == "IDLE"
+
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=8000))
+    timers.fire_pending()
+    assert ctrl.state == "ACTIVE"
+    assert actuator.setpoints[-1] == -8000
+    # A fresh event must drop DESS again rather than assume it is still off.
+    assert actuator.names().count("dess_off") == 2
+
+
+# --------------------------------------------------------------------------- #
+# The END line has to name its trigger
+#
+# Attributing an event end used to mean hand-matching timestamps between the
+# agent log and the WORKMODE capture, which is how a foreign automation
+# truncating mFRR events went unnoticed for a morning.
+# --------------------------------------------------------------------------- #
+
+def test_end_log_names_the_command_that_ended_the_event(
+    actuator, clock, timers, make_command, caplog
+):
+    ctrl = make_controller(actuator)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=5000))
+    timers.fire_pending()
+
+    with caplog.at_level("INFO"):
+        ctrl.on_workmode(make_command(source="optimizer", mode="limitexport", power=0))
+
+    end = [r for r in caplog.records if "mFRR END" in r.getMessage()]
+    assert len(end) == 1
+    assert "optimizer/limitexport" in end[0].getMessage()
+
+
+def test_end_log_names_the_failsafe_that_ended_the_event(
+    actuator, clock, timers, make_command, caplog
+):
+    ctrl = make_controller(actuator, max_duration_s=100.0)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=5000))
+    timers.fire_pending()
+
+    clock.advance(101.0)
+    with caplog.at_level("INFO"):
+        ctrl.tick()
+
+    end = [r for r in caplog.records if "mFRR END" in r.getMessage()]
+    assert len(end) == 1
+    assert "failsafe" in end[0].getMessage()

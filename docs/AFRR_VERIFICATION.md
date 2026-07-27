@@ -6,7 +6,8 @@ customers on a **Qilowatt hardware controller** (Modbus R2 etc.) it is automatic
 that: it is a custom Python agent that impersonates a Qilowatt inverter via
 `qilowatt-py` and implements an **mFRR-only** state machine
 ([`agent/mfrr_statemachine.py`](../agent/mfrr_statemachine.py), acts only on
-`_source in {fusebox, kratt}` + `Mode in {frrup, frrdown}`).
+`_source in {fusebox, kratt}` + `Mode in {frrup, frrdown}` + non-zero
+`PowerLimit`).
 
 So the "nothing to do" promise does **not** automatically apply here. This is a
 **verify-only** procedure: observe what actually arrives, classify it, and
