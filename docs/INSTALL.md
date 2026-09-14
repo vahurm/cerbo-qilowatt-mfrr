@@ -15,9 +15,13 @@ if you want a co-resident curtailment flow or a dashboard.
 - SSH enabled (Settings → General → SSH on LAN) and a root password set.
 - A Qilowatt device with `device_id` + MQTT username/password (from Qilowatt
   support), and mFRR market access for the site.
-- Know your PV topology so you can pick `QW_TELEMETRY_PROFILE`:
-  - `dc_coupled` — PV on the battery DC bus via Victron MPPT (e.g. site A).
-  - `ac_coupled` — PV inverter on the MultiPlus AC output (e.g. site B).
+- Your grid connection's import and export limits in W (`QW_MAX_IMPORT_W` /
+  `QW_MAX_EXPORT_W`). The agent warns at start-up while they are unset or at
+  the example value; `qw_doctor.sh` suggests a figure from the AC input limit.
+- PV topology no longer matters for telemetry: the default `auto` profile sums
+  DC MPPTs and PV inverters on both the output and the grid side.
+- The README's "What your site must have" table lists the dbus paths and ESS
+  settings that must be present; `qw_doctor.sh` checks every one of them.
 
 > **One client per device.** Qilowatt allows a single active MQTT client per
 > `device_id`. If a Home Assistant `qilowatt-ha` integration currently uses these
@@ -29,13 +33,20 @@ if you want a co-resident curtailment flow or a dashboard.
 ## 0. The short way
 
 [`deploy/install.sh`](../deploy/install.sh) does steps 1–3 and 6 (plus the
-diagnostics and the hourly log audit) in one idempotent run from your
-workstation; you then do steps 4 and 5 by hand. The rest of this page is the
-manual equivalent, for understanding what lands where.
+diagnostics, the hourly log audit and the `VERSION` stamp) in one idempotent
+run from your workstation, asks for the four per-site values if no env exists
+(step 4), can run the dry-run window (step 5) and the restart for you, and ends
+with the `qw_doctor.sh` self-check. The rest of this page is the manual
+equivalent, for understanding what lands where.
 
 ```sh
-CERBO_HOST=root@<cerbo-ip> ./deploy/install.sh
+CERBO_HOST=root@<cerbo-ip> ./deploy/install.sh                      # install, doctor
+CERBO_HOST=root@<cerbo-ip> ./deploy/install.sh --dry-run-window 120    # validate the new code
+CERBO_HOST=root@<cerbo-ip> ./deploy/install.sh --restart               # go live
 ```
+
+See [`deploy/README.md`](../deploy/README.md) for all options (`--uninstall`,
+`--pylib-tarball`, …).
 
 ## 1. Actuator scripts
 
@@ -110,19 +121,25 @@ PYTHONPATH=/data/qw-agent/pylib QW_AGENT_ENV=/data/qw-agent.env \
 ```sh
 scp .env.example root@<cerbo-ip>:/data/qw-agent.env
 ssh root@<cerbo-ip> 'chmod 600 /data/qw-agent.env'
-# edit /data/qw-agent.env: fill QW_DEVICE_ID / QW_MQTT_USER / QW_MQTT_PASS,
-# set QW_TELEMETRY_PROFILE and the QW_MAX_IMPORT_W / QW_MAX_EXPORT_W limits.
+# edit /data/qw-agent.env: fill QW_DEVICE_ID / QW_MQTT_USER / QW_MQTT_PASS
+# and the QW_MAX_IMPORT_W / QW_MAX_EXPORT_W limits.
 ```
 
 Then decide the site-specific policy knobs, each explained in `.env.example`:
 
 | Variable | Decide |
 |---|---|
-| `QW_MFRR_SOURCES` | which dispatchers to obey (`fusebox,kratt`, plus `qilowatt` if your trader uses it — check with `afrr_probe.py`) |
+| `QW_MFRR_SOURCES` | which dispatchers to obey (default `fusebox,kratt,qilowatt`; never `optimizer`). A dispatch from a source not listed is logged as `dropping FRR dispatch` |
 | `QW_MFRR_MIN_SOC` | how deep mFRR may discharge; must be *below* the dashboard Minimum SOC |
 | `QW_TRADE_MODES` | honour Qilowatt's Q trades (`buy,sell`, default) or drop them (empty) |
 | `QW_MAX_EVENT_S`, `QW_MAX_TRADE_S` | event caps; both must stay below the watchdog's `QW_MAX_OFF_SECS` |
 | `QW_IDLE_REFRESH_S` | restart-on-silence backstop; keep above the site's real command silence or set 0 |
+| `QW_ALERT_URL` | optional: where `qw_log_audit.sh` POSTs WARN/ERROR findings (ntfy, webhook) |
+| `QW_STATE_FILE` | where the agent mirrors its state as JSON (`/data/qw-agent/state.json`); empty = off |
+
+The agent re-checks the risky ones at every start and logs `CONFIG WARN: …`
+for each finding (caps ordering, missing/example import-export caps,
+`QW_MFRR_MIN_SOC` vs the live floor, trades disabled).
 
 > **QW_DEVICE_ID gotcha:** this is the MQTT topic id (`Q/<id>/SENSOR`,
 > `Q/<id>/cmnd/backlog`). When migrating off `qilowatt-ha`, use the config
@@ -131,10 +148,21 @@ Then decide the site-specific policy knobs, each explained in `.env.example`:
 
 ## 5. Validate in dry-run (no dbus writes)
 
+The easy way is `./deploy/install.sh --dry-run-window 120`, which stops the
+service, runs the new code for two minutes with `QW_DRY_RUN=1`, prints its log
+and restores the service. By hand:
+
 ```sh
-# qilowatt-ha stopped during this window (single-client rule):
+# qilowatt-ha / the service stopped during this window (single-client rule):
 PYTHONPATH=/data/qw-agent/pylib QW_AGENT_ENV=/data/qw-agent.env \
   QW_DRY_RUN=1 python3 /data/qw-agent/qw_agent.py
+```
+
+To see what the agent would have done with *your* dispatch history before
+that, replay the durable capture offline on any machine:
+
+```sh
+python3 tools/replay.py --log afrr-workmode.log --env qw-agent.env --timeline
 ```
 
 Confirm in the logs that WORKMODE commands decode correctly (the portal pushes a
@@ -182,17 +210,14 @@ EOF
 chmod 755 /data/rc.local
 ```
 
-## 7. Optional: Node-RED flow
+## 7. Optional: Node-RED as a read-only consumer
 
 Only if you run Venus OS Large and want a co-resident curtailment flow or a
 dashboard. Set `QW_LOCAL_BRIDGE=1` in the env so the agent republishes the
-decoded WORKMODE to the local broker, then:
-
-1. Open `http://<cerbo-ip>:1880`.
-2. Menu → Import → `nodered/flow.json` → Import to a new flow.
-3. The tab imports **disabled** (blue) on purpose. With the pure-Python state
-   machine already actuating, keep this flow's actuators disabled to avoid a
-   double-driver — use it for visibility / curtailment integration only.
+decoded WORKMODE and its event state to the local broker, then have your flow
+subscribe to `qw/mfrr_active`, `qw/online` (and optionally `qw/mfrr_kind`) as
+described in `nodered/curtailment-mfrr-aware.md`. Do **not** import the legacy
+orchestrator in `contrib/nodered-legacy/` on a site where the agent runs.
 
 ## Verify end-to-end
 
@@ -206,33 +231,52 @@ mosquitto_sub -h 127.0.0.1 -t 'qw/#' -v
 On the Cerbo itself:
 
 ```sh
+/data/qw_doctor.sh                             # PASS/WARN/FAIL self-check of the whole site
 svstat /service/qw-agent                       # up, pid, uptime
 tail -F /var/log/qw-agent/current              # mFRR/TRADE START/END lines
+cat /data/qw-agent/state.json                  # state, kind, signed W, degraded, version
 /data/qw_dess_toggle.sh status                 # DESS Mode + SOC floor, saved state
 /data/qw_log_audit.sh                          # what changed since the last hour
 python3 /data/qw-agent/afrr_probe.py --log /data/afrr-workmode.log   # stream classifier
 ```
 
+The first log line after a restart is
+`Starting qw_agent <version> (install <VERSION stamp>) …`; a `STARTUP RECOVERY`
+line right after it means the previous process died mid-event and the agent
+returned the site to normal before connecting. If something is off, go through
+[`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
+
 ## Development: running the tests
 
 The agent logic is covered by a `pytest` suite plus dependency-free POSIX-sh
-tests for the three shell scripts. They need no Cerbo, dbus, or network — dbus
-access degrades to zeros off Venus OS, and the actuators / telemetry / `dbus`
-CLI are driven through fakes. Run them on a workstation:
+tests for every shell script. They need no Cerbo, dbus, or network — the
+actuators / telemetry / `dbus` CLI are driven through fakes. Run them on a
+workstation:
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r agent/requirements.txt -r requirements-dev.txt
-pytest -q                      # state machine, telemetry, config, actuators, probe
+make test                      # everything below
+pytest -q                      # state machine, actuators (read-back), startup,
+                               # telemetry, bridge contract, config, probe, replay
 sh tests/test_grid_setpoint.sh # asymmetric import/export clamp
 sh tests/test_dess_toggle.sh   # DESS + SOC-floor save/lower/restore, --no-floor
-sh tests/test_log_audit.sh     # audit findings, incremental window, silence check
+sh tests/test_log_audit.sh     # audit findings, incremental window, silence, alerts
+sh tests/test_doctor.sh        # self-check verdicts against a stubbed site
+make lint                      # shellcheck (POSIX sh) — pip install shellcheck-py
 ```
 
 CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs all of them
-on every push and pull request.
+on Python 3.8, 3.10 and 3.12 plus shellcheck on every push and pull request.
 
 ## Uninstall / rollback
+
+```sh
+CERBO_HOST=root@<cerbo-ip> ./deploy/install.sh --uninstall          # keeps qw-agent.env
+CERBO_HOST=root@<cerbo-ip> ./deploy/install.sh --uninstall --purge  # removes it too
+```
+
+or by hand, minimum to stop actuating:
 
 ```sh
 svc -d /service/qw-agent        # stop the agent (its shutdown reverts any active event)

@@ -152,14 +152,46 @@ charges.
    site, not "expected". It examines only lines added since its previous run, so
    a one-off event is reported once. Every defect this project has hit was
    visible in the log for weeks before anyone noticed, which is what this exists
-   to fix.
+   to fix. Set `QW_ALERT_URL` to have WARN/ERROR findings pushed to you (ntfy,
+   Slack/Discord/Home Assistant webhook); it also flags three or more Q trades
+   in a window with no mFRR dispatch following them.
+
+7. **Actuator read-back** — every setpoint and DESS write is read back
+   (`qw_grid_setpoint.sh get`, `qw_dess_toggle.sh status`). A write that does
+   not stick — the clamp rejected it, dbus dropped it, another controller
+   overwrote it — is retried once and then logged as `actuation failed`; the
+   state machine raises a `degraded` flag (bridge `qw/mfrr_degraded`,
+   `state.json`) but keeps tracking the event, so the end command, the duration
+   cap and the DESS watchdog all still get to clean up. Before this, a rejected
+   27 kW request left the event "ACTIVE" in the log while nothing was delivered.
+
+8. **Start-up recovery** — a process that dies mid-event (traceback, `kill -9`,
+   power cut) leaves DESS off with the setpoint parked. The watchdog covers the
+   first case within `QW_MAX_OFF_SECS`, but not a reboot: its stamp lives on
+   `/tmp` and is gone, while the saved DESS Mode on `/data` and the Mode=0
+   setting persist — DESS would stay off indefinitely. At start the agent
+   checks the toggle script's state files and, if any exist, writes setpoint 0
+   and DESS on before connecting (`STARTUP RECOVERY`). If the event is in fact
+   still running, the portal's post-connect snapshot reopens it ~20 s later.
+
+9. **Telemetry guard** — with dbus unavailable or `/Dc/Battery/Soc` unreadable
+   the agent publishes **no** SENSOR at all (`telemetry unavailable`, once a
+   minute) rather than zeros. An all-zero payload reads as "battery empty, grid
+   idle" to the optimiser and would drive buys and dispatch decisions on
+   fiction; an offline device is the honest state.
+
+10. **Start-up config check** — `CONFIG WARN` lines flag an event cap that is
+    not below the watchdog cap, import/export caps that are unset or still the
+    example 15000 W, a `QW_MFRR_MIN_SOC` that is not below the live floor, and
+    trades disabled. `qw_doctor.sh` checks the same things (plus the dbus paths,
+    ESS mode, service and loops) from the outside; `install.sh` runs it last.
 
 ## Operator responsibilities
 
 - **Set `QW_MAX_IMPORT_W` / `QW_MAX_EXPORT_W` correctly** for the physical
   connection (import capacity and feed-in cap). Do not rely on the defaults.
-- **Pick the right `QW_TELEMETRY_PROFILE`** (`dc_coupled` vs `ac_coupled`) so PV
-  power is read from the correct dbus path.
+- **Run `qw_doctor.sh` after every install and after a firmware update**, and
+  fix every FAIL before going live. Paste its output into any issue.
 - **Validate telemetry** (`SENSOR` payload) against your real system before relying
   on market settlement — incorrect telemetry can misrepresent available flexibility.
 - **Dry-run first** (`QW_DRY_RUN=1`) and start with small values before going live.
@@ -182,8 +214,12 @@ charges.
   whether the firmware ignores the register or ever starts honouring it; deleting
   it is not, because the value it would be recreated with is unknown.
 - **Never run two orchestrators at once** (e.g. an old HA automation, the agent's
-  state machine, and a Node-RED actuator flow) — they write the same dbus paths and
-  will race.
+  state machine, and the legacy Node-RED flow in `contrib/nodered-legacy/`) —
+  they write the same dbus paths and will race. A Node-RED flow may *read* the
+  bridge topics; it must not write `AcPowerSetPoint` or `DynamicEss/Mode`.
+- **Take `actuation failed` / `degraded` seriously.** It means the site claims
+  an event it is not delivering. Find the second writer or the dbus fault the
+  same day; the audit reports it as ERROR.
 - **The second orchestrator can be in the vendor's cloud.** On 2026-07-27
   Qilowatt's Energy Optimizer was enabled on both sites; it writes the same
   WorkMode channel as the mFRR dispatcher, on 15-minute slot boundaries, and it

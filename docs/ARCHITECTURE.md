@@ -119,20 +119,45 @@ Every START/END line names the kind and the trigger:
 | event state          | `qw/mfrr_active`     | `on` while ACTIVE (either kind) — curtailment stands down |
 | event kind           | `qw/mfrr_kind`       | `frr` / `trade` / `none`                             |
 | signed setpoint      | `qw/mfrr_signed_w`   | negative = export, positive = import                 |
+| degraded             | `qw/mfrr_degraded`   | `true` while the last actuator write did not read back |
+| liveness             | `qw/online`          | retained `true` / `false` (LWT)                      |
 
 `mfrr_active` is `on` for trades as well: a `sell` is an export exactly like
 `frrup`, and holding PV at 100 % during a `buy` costs nothing. A flow that wants
-to behave differently per kind reads `mfrr_kind`.
+to behave differently per kind reads `mfrr_kind`. Topic names and payloads are
+a contract pinned by `tests/test_local_bridge_contract.py`.
 
-### Node-RED (optional, legacy flow)
+The same state is mirrored to `QW_STATE_FILE` (`/data/qw-agent/state.json`) for
+consumers without a broker.
 
-`nodered/flow.json` predates the Python state machine and implements a coarser
-IDLE/ACTIVE flow (no mode, power or trade handling; it holds a zero-power FRR
-command as a 0 W event). Do **not** run its actuator nodes alongside the agent —
-two orchestrators writing the same dbus paths will race. Its remaining use is the
-curtailment stand-down described in
-[`../nodered/curtailment-mfrr-aware.md`](../nodered/curtailment-mfrr-aware.md),
-driven by `qw/mfrr_active`.
+### Node-RED (optional, read-only consumer)
+
+A Node-RED flow on the same Cerbo should only *read* the bridge topics — the
+PV-curtailment stand-down in
+[`../nodered/curtailment-mfrr-aware.md`](../nodered/curtailment-mfrr-aware.md)
+is the reference. The original Node-RED orchestrator lives in
+[`../contrib/nodered-legacy/`](../contrib/nodered-legacy/README.md) and must
+**not** run alongside the agent — two writers on the same dbus paths race.
+
+### Start-up, read-back and degraded state
+
+- **Start-up recovery** (`agent/startup.py`): a process that died mid-event
+  (crash, `kill -9`, reboot) leaves `qw_dess_toggle.sh`'s saved-Mode file on
+  `/data` and DESS off; the watchdog cannot see a reboot because its stamp is
+  on `/tmp`. Before connecting, the agent checks those files and, if present,
+  writes setpoint 0 and DESS on (`STARTUP RECOVERY` in the log). The
+  post-connect WORKMODE snapshot reopens the event if it is still running.
+- **Config sanity** (`CONFIG WARN`): event caps vs the watchdog cap, missing or
+  example-default import/export caps, `QW_MFRR_MIN_SOC` vs the live floor,
+  trades disabled.
+- **Read-back**: `ScriptActuator` reads AcPowerSetPoint (`get`) and DESS Mode
+  (`status`) back after every write and returns a bool. The state machine
+  retries a failed write once; a second failure logs `actuation failed`, sets
+  `degraded=True` (bridge `qw/mfrr_degraded`, `state.json`) and keeps tracking
+  the event so the end command, the cap and the watchdog can still clean up.
+- **Telemetry guard**: no SENSOR is published while dbus or `/Dc/Battery/Soc`
+  is unreadable (`telemetry unavailable`, once a minute). An all-zero payload
+  would tell the optimiser the battery is empty.
 
 ## Why a Python daemon (and why the vendor library)
 

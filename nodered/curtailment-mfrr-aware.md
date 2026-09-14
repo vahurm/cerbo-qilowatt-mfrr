@@ -9,7 +9,7 @@ mFRR events. Otherwise the two flows fight:
   toward **zero export** (conservative fallback).
 - That cancels most of the **frrup** (export) capacity you are being paid to deliver.
 
-The mFRR flow in [`flow.json`](flow.json) publishes a shared Node-RED **global**
+The mFRR flow in [`contrib/nodered-legacy/flow.json`](../contrib/nodered-legacy/flow.json) (legacy) publishes a shared Node-RED **global**
 flag at every transition:
 
 ```javascript
@@ -21,16 +21,23 @@ global.set('qw_mfrr', { active: false, mode: '', signed_watts: 0, ts: <ms> });
 Because both flows run in the same Node-RED instance, they share `global` context
 — no extra wiring or MQTT needed.
 
-**If the Python agent is the orchestrator** (the normal setup — `flow.json`'s
-state machine stays disabled), the flag does not come from `global`. Set
-`QW_LOCAL_BRIDGE=1` and subscribe to the retained topics the agent publishes:
+**If the Python agent is the orchestrator** (the normal setup — the legacy
+`contrib/nodered-legacy/flow.json` state machine is not imported or stays
+disabled), the flag does not come from `global`. Set `QW_LOCAL_BRIDGE=1` and
+subscribe to the retained topics the agent publishes:
 
 | Topic               | Payload                         |
 |---------------------|---------------------------------|
+| `qw/online`         | `true` / `false` — retained LWT; treat `false` as "no event" (stale-guard) |
 | `qw/mfrr_active`    | `on` while any event is running |
 | `qw/mfrr_kind`      | `frr` / `trade` / `none`        |
 | `qw/mfrr_signed_w`  | signed W (negative = export)    |
+| `qw/mfrr_degraded`  | `true` while the last actuator write did not read back |
 | `qw/qw_mode`        | `frrup` / `frrdown` / `buy` / `sell` / … |
+
+These names and payloads are a contract pinned by
+`tests/test_local_bridge_contract.py`; new topics may be added, existing ones
+will not be renamed.
 
 Map them into the same `qw_mfrr` object (`active = mfrr_active == 'on'`,
 `mode = qw_mode`, `signed_watts = mfrr_signed_w`) and the patch below works
