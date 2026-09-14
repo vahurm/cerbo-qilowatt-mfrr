@@ -220,6 +220,37 @@ say "2026-07-26 10:03:00 INFO qw_agent.mfrr: mFRR END (failsafe: event > 7200s):
 out=$(run)
 assert_missing "no foreign-end false alarm" "foreign automation" "$out"
 
+echo "=== scenario 15: Q trade lifecycle is informational, exits 0 ==="
+reset
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 27000 W after 2.0s (until SOC 100%)"
+say "2026-09-14 10:00:01 INFO qw_agent.mfrr: capping import 30000 W to the import limit 28000 W"
+say "2026-09-14 11:10:00 INFO qw_agent.mfrr: TRADE END (trade target reached: SOC 100% >= 100%): grid setpoint 0, DESS on"
+say "2026-09-14 12:00:00 INFO qw_agent.mfrr: TRADE END (qilowatt/buy 0 W): grid setpoint 0, DESS on"
+say "2026-09-14 13:00:00 INFO qw_agent.mfrr: TRADE END (kratt/frrup 0 W): grid setpoint 0, DESS on"
+out=$(run)
+assert_contains "trade starts counted"   "Q trades started" "$out"
+assert_contains "SOC-target ends counted" "reaching the commanded target" "$out"
+assert_contains "cap reported"           "was capped" "$out"
+assert_missing  "no foreign-end alarm for trade ends" "foreign automation" "$out"
+reset
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 27000 W after 2.0s"
+assert_eq "exit 0 for informational trade findings" "0" "$(run_rc)"
+
+echo "=== scenario 16: a foreign end of a TRADE is reported like an mFRR one ==="
+reset
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: TRADE END (optimizer/savebattery 0 W): grid setpoint 0, DESS on"
+out=$(run)
+assert_contains "foreign trade end reported" "foreign automation" "$out"
+reset
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: TRADE END (optimizer/savebattery 0 W): grid setpoint 0, DESS on"
+assert_eq "exit 1 on foreign trade end" "1" "$(run_rc)"
+
+echo "=== scenario 17: qilowatt/buy ending an mFRR event points at QW_TRADE_MODES ==="
+reset
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: mFRR END (qilowatt/buy 27000 W): grid setpoint 0, DESS on"
+out=$(run)
+assert_contains "trades-disabled hint" "Q trades disabled" "$out"
+
 echo "-----------------------------------------"
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]

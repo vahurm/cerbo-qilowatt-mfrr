@@ -29,7 +29,7 @@ mqtt.qilowatt.it:8883 (TLS)
 │  qw_agent.py (qilowatt-py)                                      │
 │    • receives WORKMODE backlog commands                         │
 │    • reports telemetry from dbus via a profile (dc/ac_coupled)  │
-│    • mfrr_statemachine.py  (IDLE / ACTIVE + failsafes)          │
+│    • mfrr_statemachine.py  (IDLE / ACTIVE[frr|trade] + failsafes)│
 │    • → /data/qw_*.sh actuators                                  │
 │    • (optional) republishes WORKMODE → local MQTT for Node-RED  │
 │                          │                                      │
@@ -45,20 +45,47 @@ local bridge (`QW_LOCAL_BRIDGE=1`) it is also republished for Node-RED / dashboa
 
 | WorkModeCommand field | Local MQTT topic    | Meaning                          |
 |-----------------------|---------------------|----------------------------------|
-| `_source`             | `qw/qw_source`      | `fusebox`/`kratt`/… (mFRR active)|
-| `Mode`                | `qw/qw_mode`        | `frrup`/`frrdown`/`normal`       |
+| `_source`             | `qw/qw_source`      | `fusebox`/`kratt`/`qilowatt`/…   |
+| `Mode`                | `qw/qw_mode`        | `frrup`/`frrdown`/`buy`/`sell`/`normal` |
 | `PowerLimit`          | `qw/qw_powerlimit`  | watts                            |
 | (connection state)    | `qw/qw_connected`   | `on`/`off`                       |
+| (event state)         | `qw/mfrr_active`, `qw/mfrr_kind`, `qw/mfrr_signed_w` | `on`/`off`, `frr`/`trade`/`none`, signed W |
+
+## What the agent actuates
+
+Two kinds of event share one `ACTIVE` state and the same DESS-off → setpoint →
+release path:
+
+| Kind    | `_source` (gate)            | `Mode`             | Setpoint             | SOC floor | Ends on |
+|---------|-----------------------------|--------------------|----------------------|-----------|---------|
+| `frr`   | `QW_MFRR_SOURCES`           | `frrup` / `frrdown`| −P export / +P import| lowered to `QW_MFRR_MIN_SOC` | 0 W stand-down, non-event command, `QW_MAX_EVENT_S`, link lost |
+| `trade` | `QW_TRADE_SOURCES` (`qilowatt`) | `buy` / `sell` (`QW_TRADE_MODES`) | +P import / −P export | untouched | same, plus live SOC reaching the command's `BatterySoc`, `QW_MAX_TRADE_S` |
+
+`trade` is Qilowatt's SOC preparation between balancing activations — the portal
+labels it **Q** / BUY; on the wire it is `_source: qilowatt`, `Mode: buy`,
+`BatterySoc: <target>`. On site A it arrives 5–30 min after a `kratt/frrup`
+stand-down and the next `frrup` follows 5–30 min later. A command of the other
+kind switches the event in place (setpoint rewritten, no DESS on/off in between).
+Every other Mode from any source — `savebattery`, `limitexport`, `normal`, … —
+is dropped and ends a running event. Set `QW_TRADE_MODES=` (empty) to drop
+trades as well.
+
+`PowerLimit` is capped to `QW_MAX_IMPORT_W` / `QW_MAX_EXPORT_W` in the agent
+before it reaches `qw_grid_setpoint.sh`, whose clamp would otherwise *reject* an
+oversized request and leave the previous setpoint in place.
 
 ## Repository layout
 
 ```
 agent/        qw_agent.py, mfrr_statemachine.py, actuators.py,
               telemetry/ (base + dc_coupled + ac_coupled profiles), requirements.txt
-scripts/      qw_dess_toggle.sh, qw_grid_setpoint.sh, qw_dess_watchdog.sh
+scripts/      qw_dess_toggle.sh, qw_grid_setpoint.sh, qw_dess_watchdog.sh, qw_log_audit.sh
+tools/        afrr_probe.py (read-only WORKMODE classifier: FRR / Q trade / unknown)
 nodered/      flow.json (optional curtailment/dashboard) + curtailment-mfrr-aware.md
 service/      daemontools service template for the daemon
-docs/         ARCHITECTURE.md, INSTALL.md, SAFETY.md
+deploy/       install.sh (rsync + restart over SSH)
+docs/         ARCHITECTURE.md, INSTALL.md, SAFETY.md, AFRR_VERIFICATION.md
+tests/        pytest suite + POSIX-sh tests for the three scripts
 .env.example  per-site config template (real values stay untracked)
 ```
 
@@ -68,7 +95,8 @@ docs/         ARCHITECTURE.md, INSTALL.md, SAFETY.md
 2. Copy `.env.example` to a private `/data/qw-agent.env` on the Cerbo and fill in
    your Qilowatt `device_id` + MQTT credentials.
 3. Set `QW_TELEMETRY_PROFILE` and the asymmetric `QW_MAX_IMPORT_W` /
-   `QW_MAX_EXPORT_W` limits for your site.
+   `QW_MAX_EXPORT_W` limits for your site. Decide whether the site should
+   honour Q trades (`QW_TRADE_MODES`, default `buy,sell`; see SAFETY.md).
 4. Deploy the actuator scripts and the daemon (see `docs/INSTALL.md`); validate
    with `QW_DRY_RUN=1` before going live. Node-RED is optional.
 

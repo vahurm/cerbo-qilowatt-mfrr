@@ -108,6 +108,68 @@ def test_empty_or_normal_only_is_inconclusive():
     assert v.decision == "INCONCLUSIVE"
 
 
+def test_optimizer_modes_are_known_and_do_not_trip_the_unrecognized_alarm():
+    """site A 2026-07..08: 586 `optimizer` commands (normal/savebattery/
+    limitexport/buy/sell) made the probe report SAFE-BUT-IDLE on a stream that
+    was plain block mFRR. Every documented qilowatt-ha Mode is known."""
+    recs = [_frr(0, 3000), _frr(300, 3000)] + [
+        ap.Record(source="optimizer", mode=m, power=0, ts=600.0 + i)
+        for i, m in enumerate(["savebattery", "limitexport", "pvsell", "nobattery", "normal"])
+    ]
+    v = ap.classify_stream(recs)
+    assert v.unrecognized_count == 0
+    assert v.unknown_modes == set()
+    assert v.fingerprint == "block_mfrr"
+
+
+def test_q_trades_are_counted_separately_and_not_as_frr():
+    recs = [
+        ap.Record(source="qilowatt", mode="buy", power=27000, ts=0.0),
+        ap.Record(source="qilowatt", mode="buy", power=0, ts=60.0),       # stand-down
+        ap.Record(source="qilowatt", mode="sell", power=8000, ts=7200.0),
+        _frr(9000.0, 15000, mode="frrup"),
+    ]
+    v = ap.classify_stream(recs)
+    assert v.trade_count == 3
+    assert v.trade_modes == {"buy": 2, "sell": 1}
+    assert v.trade_zero_power == 1
+    assert v.trade_power_median_w == (27000 + 8000) / 2
+    assert v.frr_count == 1
+    assert v.unrecognized_count == 0
+    assert recs[0].is_trade and not recs[0].is_frr
+
+
+def test_trade_followed_by_frr_latency():
+    """buy at t=0 → frrup 20 min later counts; a buy with no dispatch within
+    the 2 h window does not; a 0 W frrup is a stand-down, not a follow-up."""
+    recs = [
+        ap.Record(source="qilowatt", mode="buy", power=27000, ts=0.0),
+        _frr(600.0, 0, mode="frrup"),
+        _frr(1200.0, 15000, mode="frrup"),
+        ap.Record(source="qilowatt", mode="buy", power=27000, ts=20000.0),
+    ]
+    v = ap.classify_stream(recs)
+    assert v.trade_followed_by_frr == 1
+    assert v.trade_to_frr_median_s == 1200.0
+
+
+def test_kratt_buy_is_not_a_trade():
+    rec = ap.Record(source="kratt", mode="buy", power=1000, ts=0.0)
+    assert not rec.is_trade
+    assert ap.classify_stream([rec]).trade_count == 0
+
+
+def test_render_summary_reports_trades_when_present():
+    recs = [
+        ap.Record(source="qilowatt", mode="buy", power=27000, ts=0.0),
+        _frr(1200.0, 15000, mode="frrup"),
+    ]
+    out = ap.render_summary(ap.classify_stream(recs))
+    assert "Q trades" in out
+    assert "followed by FRR    : 1 of 1" in out
+    assert "Q trades" not in ap.render_summary(ap.classify_stream([_frr(0, 3000)]))
+
+
 def test_render_summary_contains_decision():
     v = ap.classify_stream([_frr(0, 3000), _frr(300, 3000)])
     out = ap.render_summary(v)

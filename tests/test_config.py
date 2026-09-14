@@ -99,14 +99,21 @@ def test_config_defaults(monkeypatch):
     assert cfg.local_bridge is False
     assert cfg.link_restart_s == 600.0
     assert cfg.subscribe_grace_s == 120.0
-    assert cfg.idle_refresh_s == 172800.0
+    assert cfg.idle_refresh_s == 345600.0
     assert cfg.connect_attempts == 5
     assert cfg.connect_retry_s == 5.0
     assert cfg.mqtt_lost_failsafe_s == 300.0
     assert cfg.max_event_s == 7200.0
+    # Q trades are honoured by default from the vendor's SOC optimiser only.
+    assert cfg.trade_sources == ("qilowatt",)
+    assert cfg.trade_modes == ("buy", "sell")
+    assert cfg.max_trade_s == 5400.0
+    # No agent-side cap unless the site limits are configured.
+    assert cfg.max_import_w is None
+    assert cfg.max_export_w is None
 
 
-def test_max_event_cap_stays_below_the_dess_watchdog_backstop():
+def test_max_event_cap_stays_below_the_dess_watchdog_backstop(monkeypatch):
     """The agent must always be the one that ends an event.
 
     qw_dess_watchdog.sh restores DESS (and the SOC floor) without touching the
@@ -127,8 +134,12 @@ def test_max_event_cap_stays_below_the_dess_watchdog_backstop():
     assert m, "could not read QW_MAX_OFF_SECS default from qw_dess_watchdog.sh"
 
     watchdog_default = float(m.group(1))
-    agent_default = 7200.0
-    assert agent_default < watchdog_default
+    _set_environ(monkeypatch, dict(REQUIRED))
+    cfg = qw_agent.Config()
+    assert cfg.max_event_s < watchdog_default
+    # The trade cap is a second event cap on the same DESS-off state and is
+    # bound by the same ordering.
+    assert cfg.max_trade_s < watchdog_default
 
 
 def test_idle_refresh_default_clears_the_measured_command_silence(monkeypatch):
@@ -138,13 +149,14 @@ def test_idle_refresh_default_clears_the_measured_command_silence(monkeypatch):
     timer — so a default below a site's real gaps both restarts for nothing and
     erases the evidence needed to correct it. site B ran that loop for weeks at
     the old 6 h default: 49 of its 70 starts were this watchdog, and its measured
-    median gap came out as the setting itself.
+    median gap came out as the setting itself. site A then repeated it at the
+    48 h default: 3 silences of exactly 48.0 h over 72.6 d (2026-09-14 probe).
 
-    These are measured maxima (2026-07, tools/afrr_probe.py over the durable
-    WORKMODE capture), not estimates. site B's is a lower bound, because the
-    restart loop truncated every gap it did not cause.
+    These are measured maxima (tools/afrr_probe.py over the durable WORKMODE
+    capture), not estimates. Each is a lower bound, because the restart loop
+    truncated every gap it did not cause.
     """
-    measured_max_h = {"site A": 25.7, "site B": 31.9}
+    measured_max_h = {"site A": 48.0, "site B": 31.9}
 
     _set_environ(monkeypatch, dict(REQUIRED))
     default_h = qw_agent.Config().idle_refresh_s / 3600.0
@@ -175,11 +187,22 @@ def test_config_overrides(monkeypatch):
             "QW_CONNECT_ATTEMPTS": "3",
             "QW_CONNECT_RETRY_S": "2.5",
             "QW_MFRR_SOURCES": "fusebox, kratt , extra",
+            "QW_TRADE_SOURCES": "qilowatt, manual",
+            "QW_TRADE_MODES": "buy",
+            "QW_MAX_TRADE_S": "3600",
+            "QW_MAX_IMPORT_W": "28000",
+            "QW_MAX_EXPORT_W": "15000",
             "QW_DRY_RUN": "1",
         }
     )
     _set_environ(monkeypatch, env)
     cfg = qw_agent.Config()
+
+    assert cfg.trade_sources == ("qilowatt", "manual")
+    assert cfg.trade_modes == ("buy",)
+    assert cfg.max_trade_s == 3600.0
+    assert cfg.max_import_w == 28000.0
+    assert cfg.max_export_w == 15000.0
 
     assert cfg.mqtt_port == 8884
     assert cfg.mqtt_tls is False
@@ -196,6 +219,48 @@ def test_config_overrides(monkeypatch):
     assert cfg.connect_retry_s == 2.5
     assert cfg.mfrr_sources == ("fusebox", "kratt", "extra")
     assert cfg.dry_run is True
+
+
+def test_empty_trade_modes_disables_trades(monkeypatch):
+    """QW_TRADE_MODES= (empty) is the documented way back to drop-all-trades."""
+    env = dict(REQUIRED)
+    env["QW_TRADE_MODES"] = ""
+    _set_environ(monkeypatch, env)
+    assert qw_agent.Config().trade_modes == ()
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "abc"])
+def test_power_limits_unset_or_garbage_mean_no_cap(monkeypatch, raw):
+    env = dict(REQUIRED)
+    env["QW_MAX_IMPORT_W"] = raw
+    env["QW_MAX_EXPORT_W"] = raw
+    _set_environ(monkeypatch, env)
+    cfg = qw_agent.Config()
+    assert cfg.max_import_w is None
+    assert cfg.max_export_w is None
+
+
+def test_soc_reader_returns_none_without_dbus():
+    """Off-Cerbo the reader must say 'unknown', never a fake 0 that ends a sell."""
+    class _NoBus:
+        available = False
+
+        def get(self, *_a, **_k):
+            raise AssertionError("must not be called when unavailable")
+
+    assert qw_agent.make_soc_reader(_NoBus())() is None
+
+
+@pytest.mark.parametrize("raw,expected", [(87.0, 87.0), ("42", 42.0), (None, None), ("n/a", None)])
+def test_soc_reader_parses_dbus_value(raw, expected):
+    class _Bus:
+        available = True
+
+        def get(self, service, path, default=None):
+            assert service == "com.victronenergy.system" and path == "/Dc/Battery/Soc"
+            return raw
+
+    assert qw_agent.make_soc_reader(_Bus())() == expected
 
 
 def test_config_missing_required_exits(monkeypatch):

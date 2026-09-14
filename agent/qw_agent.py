@@ -32,6 +32,7 @@ from qilowatt import InverterDevice, QilowattMQTTClient, WorkModeCommand
 from actuators import DryRunActuator, ScriptActuator
 from mfrr_statemachine import MfrrController
 from telemetry import DbusReader, get_profile
+from telemetry.base import SVC_SYSTEM
 
 _logger = logging.getLogger("qw_agent")
 
@@ -64,6 +65,18 @@ def _require(name: str) -> str:
 
 def _env_bool(name: str, default: bool) -> bool:
     return os.environ.get(name, "1" if default else "0") == "1"
+
+
+def _env_float_or_none(name: str) -> Optional[float]:
+    """Float from the environment, or None when unset/empty/unparseable."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        _logger.warning("Ignoring non-numeric %s=%r", name, raw)
+        return None
 
 
 class Config:
@@ -105,6 +118,31 @@ class Config:
         # watchdog restores DESS (and the SOC floor) while the agent still holds
         # the grid setpoint and believes the event is running.
         self.max_event_s = float(os.environ.get("QW_MAX_EVENT_S", "7200"))
+        # Q trades: the vendor's SOC optimiser (`_source: qilowatt`, Mode buy /
+        # sell, BatterySoc = target) refills the battery between mFRR
+        # activations. Sources/modes here are actuated as a `trade` event on
+        # the same DESS-off + AcPowerSetPoint path; the mode set is fixed to
+        # buy/sell inside the state machine. Empty QW_TRADE_MODES = drop them
+        # (the pre-2026-09 behaviour).
+        self.trade_sources = tuple(
+            s.strip().lower()
+            for s in os.environ.get("QW_TRADE_SOURCES", "qilowatt").split(",")
+            if s.strip()
+        )
+        self.trade_modes = tuple(
+            m.strip().lower()
+            for m in os.environ.get("QW_TRADE_MODES", "buy,sell").split(",")
+            if m.strip()
+        )
+        # Cap on a single trade. A 27 kW buy from the mFRR floor to 100 % on a
+        # 38 kWh pack takes ~1.3 h; must also stay below the watchdog's cap.
+        self.max_trade_s = float(os.environ.get("QW_MAX_TRADE_S", "5400"))
+        # Grid-connection limits, also enforced by qw_grid_setpoint.sh. The
+        # script REJECTS an out-of-range value (leaving the previous setpoint
+        # in place); the agent caps instead so a 27 kW request against a 15 kW
+        # cap still delivers 15 kW. Empty = no agent-side cap.
+        self.max_import_w = _env_float_or_none("QW_MAX_IMPORT_W")
+        self.max_export_w = _env_float_or_none("QW_MAX_EXPORT_W")
         self.dess_off_delay_s = float(os.environ.get("QW_DESS_OFF_DELAY_S", "2"))
         self.tick_interval_s = float(os.environ.get("QW_TICK_INTERVAL_S", "10"))
         # Liveness watchdog: if the QW cloud link stays down this long, exit so
@@ -132,12 +170,13 @@ class Config:
         # timers exactly once — so a clean process restart is the only safe
         # refresh. 0 disables.
         #
-        # 48 h clears both measured maxima (25.7 h and >= 31.9 h, 2026-07) with
-        # room to spare. The previous 6 h default was below both, and because a
-        # restart elicits a post-connect snapshot that resets this timer, the
-        # loop it caused also hid the real gaps from measurement. Do not lower
-        # this without measuring the site first — see docs/SAFETY.md.
-        self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "172800"))
+        # 96 h clears every measured maximum (25.7 h and >= 31.9 h in 2026-07;
+        # then, at the 48 h default, site A logged 3 silences of exactly 48.0 h
+        # over 72.6 d — the setting itself, not the market). Because a restart
+        # elicits a post-connect snapshot that resets this timer, any value at
+        # or below a real gap manufactures its own evidence. Do not lower this
+        # without measuring the site first — see docs/SAFETY.md.
+        self.idle_refresh_s = float(os.environ.get("QW_IDLE_REFRESH_S", "345600"))
         # Venus OS starts this service before the network is reliably up, so the
         # first DNS resolve can fail; retry briefly instead of dying on a
         # traceback. The supervisor stays the final backstop once these run out.
@@ -209,15 +248,19 @@ class LocalBridge:
     def publish_connected(self, connected: bool) -> None:
         self._pub("qw_connected", "on" if connected else "off")
 
-    def publish_mfrr(self, state: str, signed_watts: int) -> None:
-        """Publish the derived mFRR event state for the curtailment flow.
+    def publish_mfrr(self, state: str, signed_watts: int, kind: Optional[str] = None) -> None:
+        """Publish the derived event state for the curtailment flow.
 
         ``mfrr_active`` lets the Node-RED Huawei-curtailment flow stand down
-        (hold 100%) while mFRR owns the grid setpoint, so it never fights an
-        frr-up export or frr-down import. ``mfrr_signed_w`` is informational
-        (negative = frrup/export, positive = frrdown/import).
+        (hold 100%) while the agent owns the grid setpoint, so it never fights
+        an frr-up export or frr-down import. It is ``on`` for Q trades as well:
+        a sell is an export like frrup, and holding PV at 100 % during a buy
+        costs nothing. ``mfrr_kind`` (``frr`` / ``trade`` / ``none``) tells the
+        two apart; ``mfrr_signed_w`` is informational (negative = export,
+        positive = import).
         """
         self._pub("mfrr_active", "on" if state == "ACTIVE" else "off")
+        self._pub("mfrr_kind", kind or "none")
         self._pub("mfrr_signed_w", str(int(signed_watts)))
 
 
@@ -226,12 +269,14 @@ class LocalBridge:
 # --------------------------------------------------------------------------- #
 
 class TelemetryLoop(threading.Thread):
-    def __init__(self, cfg: Config, device: InverterDevice, profile) -> None:
+    def __init__(
+        self, cfg: Config, device: InverterDevice, profile, reader: Optional[DbusReader] = None
+    ) -> None:
         super().__init__(name="TelemetryLoop", daemon=True)
         self._cfg = cfg
         self._device = device
         self._profile = profile
-        self._reader = DbusReader()
+        self._reader = reader if reader is not None else DbusReader()
         self._stop = threading.Event()
         if not self._reader.available:
             _logger.warning("dbus not available — telemetry will report zeros")
@@ -401,6 +446,25 @@ class ConnectionWatchdog:
 # Main
 # --------------------------------------------------------------------------- #
 
+def make_soc_reader(reader: DbusReader):
+    """Return a callable giving the live battery SOC (%), or None if unknown.
+
+    Used by the state machine to end a Q trade once the commanded BatterySoc
+    target is reached. Off-Cerbo (no dbus) it always returns None, so a trade
+    then runs until the next command or the duration cap — never on a fake 0.
+    """
+    def read_soc() -> Optional[float]:
+        if not reader.available:
+            return None
+        value = reader.get(SVC_SYSTEM, "/Dc/Battery/Soc", None)
+        try:
+            return None if value is None else float(value)
+        except (TypeError, ValueError):
+            return None
+
+    return read_soc
+
+
 def connect_with_retry(
     client,
     attempts: int,
@@ -450,12 +514,27 @@ def main() -> int:
     actuator = DryRunActuator() if cfg.dry_run else ScriptActuator(
         cfg.dess_script, cfg.setpoint_script
     )
+    # One dbus reader shared by telemetry and the trade SOC-target check.
+    reader = DbusReader()
     controller = MfrrController(
         actuator,
         mfrr_sources=cfg.mfrr_sources,
         mqtt_lost_failsafe_s=cfg.mqtt_lost_failsafe_s,
         max_duration_s=cfg.max_event_s,
         dess_off_delay_s=cfg.dess_off_delay_s,
+        trade_sources=cfg.trade_sources,
+        trade_modes=cfg.trade_modes,
+        max_trade_s=cfg.max_trade_s,
+        max_import_w=cfg.max_import_w,
+        max_export_w=cfg.max_export_w,
+        soc_reader=make_soc_reader(reader),
+    )
+    _logger.info(
+        "mFRR sources=%s; Q trades %s (sources=%s modes=%s cap=%ss); limits import=%s export=%s W",
+        ",".join(cfg.mfrr_sources),
+        "enabled" if cfg.trade_modes else "DISABLED",
+        ",".join(cfg.trade_sources), ",".join(cfg.trade_modes) or "-",
+        int(cfg.max_trade_s), cfg.max_import_w, cfg.max_export_w,
     )
 
     # Fan command/connection events out to the controller (+ optional bridge).
@@ -468,16 +547,20 @@ def main() -> int:
         bridge.start()
         command_handlers.append(bridge.publish_workmode)
         connection_handlers.append(bridge.publish_connected)
-        # Bridge the mFRR event state so the Node-RED curtailment flow stands
-        # down while mFRR owns the grid setpoint. Publish a retained baseline
+        # Bridge the event state so the Node-RED curtailment flow stands down
+        # while the agent owns the grid setpoint. Publish a retained baseline
         # immediately so the flow has a known state before the first event.
-        controller.on_state_change = bridge.publish_mfrr
-        # Republish the current mFRR state on every QW (re)connect so a retained
+        controller.on_state_change = (
+            lambda state, signed: bridge.publish_mfrr(state, signed, controller.kind)
+        )
+        # Republish the current state on every QW (re)connect so a retained
         # baseline exists before the first event and survives reconnects. Read
         # from the controller so a reconnect mid-event re-asserts "on", not "off".
         connection_handlers.append(
             lambda connected: (
-                bridge.publish_mfrr(controller.state, controller.last_signed_watts)
+                bridge.publish_mfrr(
+                    controller.state, controller.last_signed_watts, controller.kind
+                )
                 if connected else None
             )
         )
@@ -510,7 +593,7 @@ def main() -> int:
         tls=cfg.mqtt_tls,
     )
 
-    telemetry = TelemetryLoop(cfg, device, profile)
+    telemetry = TelemetryLoop(cfg, device, profile, reader=reader)
     # Start telemetry only once the link is up. Setting the first energy+metrics
     # data triggers qilowatt-py's start_timers(), which publishes STATUS0
     # immediately; doing that before the MQTT connection is established loses the

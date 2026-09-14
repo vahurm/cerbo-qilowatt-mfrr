@@ -26,3 +26,9 @@ jobs:
 
       - name: Run shell tests (setpoint clamp)
         run: sh tests/test_grid_setpoint.sh
+
+      - name: Run shell tests (DESS toggle + SOC floor)
+        run: sh tests/test_dess_toggle.sh
+
+      - name: Run shell tests (log audit)
+        run: sh tests/test_log_audit.sh

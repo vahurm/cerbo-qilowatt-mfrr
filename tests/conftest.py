@@ -34,8 +34,13 @@ class FakeActuator:
     def __init__(self) -> None:
         self.calls: list = []
 
-    def dess_off(self) -> None:
-        self.calls.append(("dess_off",))
+    def dess_off(self, lower_floor: bool = True) -> None:
+        # Recorded as a bare ("dess_off",) for the default (FRR) path so the
+        # existing assertions stay readable; trades record the flag.
+        if lower_floor:
+            self.calls.append(("dess_off",))
+        else:
+            self.calls.append(("dess_off", "--no-floor"))
 
     def dess_on(self) -> None:
         self.calls.append(("dess_on",))

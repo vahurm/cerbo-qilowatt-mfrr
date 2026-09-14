@@ -54,16 +54,29 @@ from typing import Dict, List, Optional
 
 # Sources the state machine treats as an active mFRR event. "qilowatt" is the
 # vendor's own trading desk: it dispatches frrup/frrdown (the only balancing
-# channel site B is on) but also sends Mode=buy optimiser trades, which
-# the state machine's mode gate drops.
+# channel site B is on) but also sends Mode=buy SOC-preparation trades
+# (the portal's "Q" / BUY), which the agent actuates as a `trade` event when
+# QW_TRADE_MODES allows it.
 MFRR_SOURCES = {"fusebox", "kratt", "qilowatt"}
+# Sources whose buy/sell the agent may actuate as a Q trade (mirrors the
+# QW_TRADE_SOURCES default).
+TRADE_SOURCES = {"qilowatt"}
 # Non-mFRR sources the agent ignores. Documented by qilowatt-ha (timer,
 # optimizer, manual) plus values observed live on the site A cloud stream
 # ("notimer" = the idle/return-to-normal command after an event).
 KNOWN_OTHER_SOURCES = {"timer", "notimer", "optimizer", "manual", "normal", ""}
-# Modes documented by qilowatt-ha.
+# Modes documented by qilowatt-ha (const.py / README, 2026-09): the balancing
+# pair, the Q trade pair, and the Energy Optimizer's arbitrage modes. All of
+# them are known to the agent (dropped or actuated on purpose); only a Mode
+# outside this set is a genuinely new signal.
 FRR_MODES = {"frrup", "frrdown"}
-KNOWN_MODES = {"normal", "buy", "sell", "frrup", "frrdown"}
+TRADE_MODES = {"buy", "sell"}
+KNOWN_MODES = FRR_MODES | TRADE_MODES | {
+    "normal", "savebattery", "limitexport", "pvsell", "nobattery",
+}
+# A trade followed by FRR dispatch within this window counts as "prepared" the
+# activation (the measured site A gap is 5-30 min).
+TRADE_TO_FRR_WINDOW_S = 2 * 3600.0
 # WorkModeCommand dataclass fields (qilowatt-py src/qilowatt/models.py). Anything
 # outside this set arrives in the library's ``extras`` dict — a strong hint that
 # a new signal type (e.g. an aFRR setpoint field) is in play.
@@ -97,6 +110,11 @@ class Record:
     @property
     def is_frr(self) -> bool:
         return self.source in MFRR_SOURCES and self.mode in FRR_MODES
+
+    @property
+    def is_trade(self) -> bool:
+        """A Q trade: the vendor's SOC optimiser asking for a buy/sell."""
+        return self.source in TRADE_SOURCES and self.mode in TRADE_MODES
 
     @property
     def is_unrecognized(self) -> bool:
@@ -224,6 +242,14 @@ class StreamVerdict:
     unknown_modes: set = field(default_factory=set)
     frr_median_interval_s: Optional[float] = None
     frr_power_changes: int = 0
+    # Q trades (source in TRADE_SOURCES, Mode buy/sell) and how they relate to
+    # the FRR dispatch that follows them.
+    trade_count: int = 0
+    trade_modes: Counter = field(default_factory=Counter)
+    trade_zero_power: int = 0
+    trade_power_median_w: Optional[float] = None
+    trade_followed_by_frr: int = 0
+    trade_to_frr_median_s: Optional[float] = None
     window_s: Optional[float] = None
     commands_per_day: Optional[float] = None
     silence_median_s: Optional[float] = None
@@ -269,6 +295,7 @@ def classify_stream(
     """Classify a batch of WORKMODE records into an aFRR fingerprint + decision."""
     v = StreamVerdict(total=len(records))
     frr_records: List[Record] = []
+    trade_records: List[Record] = []
 
     for r in records:
         v.sources[r.source] += 1
@@ -282,8 +309,11 @@ def classify_stream(
             v.unrecognized_count += 1
         if r.is_frr:
             frr_records.append(r)
+        elif r.is_trade:
+            trade_records.append(r)
 
     v.frr_count = len(frr_records)
+    _summarise_trades(v, trade_records, frr_records)
 
     # Cadence + setpoint churn of the FRR commands (the aFRR-vs-mFRR tell).
     timed = [r.ts for r in frr_records if r.ts is not None]
@@ -335,6 +365,39 @@ def classify_stream(
     return v
 
 
+def _summarise_trades(
+    v: StreamVerdict, trades: List[Record], frr_records: List[Record]
+) -> None:
+    """Count Q trades and measure how often/soon FRR dispatch follows one.
+
+    "Followed by FRR" means a non-zero FRR command arrived within
+    TRADE_TO_FRR_WINDOW_S of a non-zero trade — the buy → frrup pattern that
+    is the whole point of honouring trades. Zero-power trades are stand-downs.
+    """
+    v.trade_count = len(trades)
+    if not trades:
+        return
+    for r in trades:
+        v.trade_modes[r.mode] += 1
+        if not r.power:
+            v.trade_zero_power += 1
+    powers = [abs(r.power) for r in trades if r.power]
+    if powers:
+        v.trade_power_median_w = _median([float(p) for p in powers])
+
+    frr_ts = sorted(r.ts for r in frr_records if r.ts is not None and r.power)
+    latencies: List[float] = []
+    for r in trades:
+        if r.ts is None or not r.power:
+            continue
+        nxt = next((t for t in frr_ts if t > r.ts), None)
+        if nxt is not None and nxt - r.ts <= TRADE_TO_FRR_WINDOW_S:
+            latencies.append(nxt - r.ts)
+    v.trade_followed_by_frr = len(latencies)
+    if latencies:
+        v.trade_to_frr_median_s = _median(latencies)
+
+
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
@@ -364,6 +427,27 @@ def render_summary(v: StreamVerdict) -> str:
         f"  unknown modes        : {', '.join(sorted(v.unknown_modes)) or '(none)'}",
         f"  extra WORKMODE keys  : {', '.join(sorted(v.extras_keys)) or '(none)'}",
     ]
+    if v.trade_count:
+        nonzero = v.trade_count - v.trade_zero_power
+        power = (
+            f"{v.trade_power_median_w / 1000.0:.1f} kW"
+            if v.trade_power_median_w is not None
+            else "n/a"
+        )
+        latency = (
+            f"{v.trade_to_frr_median_s / 60.0:.0f} min"
+            if v.trade_to_frr_median_s is not None
+            else "n/a"
+        )
+        lines.extend([
+            "-" * 68,
+            "  Q trades (source qilowatt, Mode buy/sell — actuated if QW_TRADE_MODES allows)",
+            f"    commands           : {v.trade_count} ({_top(v.trade_modes)}; "
+            f"{v.trade_zero_power} stand-downs at 0 W)",
+            f"    median PowerLimit  : {power}",
+            f"    followed by FRR    : {v.trade_followed_by_frr} of {nonzero} within "
+            f"{TRADE_TO_FRR_WINDOW_S / 3600.0:.0f} h (median gap {latency})",
+        ])
     if v.silence_max_s is not None:
         per_day = (
             f"{v.commands_per_day:.1f}/day" if v.commands_per_day is not None else "n/a"
@@ -516,7 +600,14 @@ def _print_command(rec: Record, topic: Optional[str] = None) -> None:
         if rec.ts is not None
         else "--:--:--"
     )
-    tag = "FRR" if rec.is_frr else ("UNREC" if rec.is_unrecognized else "other")
+    if rec.is_frr:
+        tag = "FRR"
+    elif rec.is_trade:
+        tag = "TRADE"
+    elif rec.is_unrecognized:
+        tag = "UNREC"
+    else:
+        tag = "other"
     extra = f" extras={rec.extras}" if rec.extras else ""
     loc = f" [{topic}]" if topic else ""
     print(

@@ -44,8 +44,17 @@ class ScriptActuator:
         except Exception as exc:
             _logger.error("actuator %s failed: %s", cmd, exc)
 
-    def dess_off(self) -> None:
-        self._run([self._dess, "off"])
+    def dess_off(self, lower_floor: bool = True) -> None:
+        """Turn DESS off; ``lower_floor=False`` leaves the SOC floor alone.
+
+        FRR dispatch lowers the shared ESS floor to QW_MFRR_MIN_SOC so frrup
+        can discharge below the arbitrage floor. A Q trade must not: a buy
+        charges upward anyway and a sell has to respect the owner's floor.
+        """
+        cmd = [self._dess, "off"]
+        if not lower_floor:
+            cmd.append("--no-floor")
+        self._run(cmd)
 
     def dess_on(self) -> None:
         self._run([self._dess, "on"])
@@ -57,8 +66,8 @@ class ScriptActuator:
 class DryRunActuator:
     """Logs intended actions without touching the system (validation phase)."""
 
-    def dess_off(self) -> None:
-        _logger.info("[dry-run] DESS off")
+    def dess_off(self, lower_floor: bool = True) -> None:
+        _logger.info("[dry-run] DESS off%s", "" if lower_floor else " (--no-floor)")
 
     def dess_on(self) -> None:
         _logger.info("[dry-run] DESS on")

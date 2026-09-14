@@ -43,6 +43,19 @@ def test_dess_off_and_on_argv(monkeypatch, actuator):
     ]
 
 
+def test_dess_off_without_floor_passes_the_flag(monkeypatch, actuator):
+    rec = _Recorder()
+    monkeypatch.setattr(actuators.subprocess, "run", rec)
+
+    actuator.dess_off(lower_floor=False)
+    actuator.dess_off(lower_floor=True)
+
+    assert rec.calls == [
+        ["/data/qw_dess_toggle.sh", "off", "--no-floor"],
+        ["/data/qw_dess_toggle.sh", "off"],
+    ]
+
+
 def test_set_setpoint_argv_positive_and_negative(monkeypatch, actuator):
     rec = _Recorder()
     monkeypatch.setattr(actuators.subprocess, "run", rec)
@@ -82,5 +95,6 @@ def test_subprocess_exception_is_swallowed(monkeypatch, actuator):
 def test_dry_run_actuator_is_inert():
     dry = actuators.DryRunActuator()
     dry.dess_off()
+    dry.dess_off(lower_floor=False)
     dry.dess_on()
     dry.set_setpoint(-15000)  # no exception, no side effects

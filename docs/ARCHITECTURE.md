@@ -6,7 +6,8 @@ Run Qilowatt mFRR participation entirely on a Victron Cerbo GX, with no Home
 Assistant in the loop. The Cerbo must own both directions of the Qilowatt cloud
 link:
 
-- **Inbound** — receive `WORKMODE` dispatch commands (the mFRR signal).
+- **Inbound** — receive `WORKMODE` dispatch commands (the mFRR signal, and the
+  vendor's SOC-preparation trades).
 - **Outbound** — report telemetry so the aggregator sees the device online and can
   verify delivery.
 
@@ -17,18 +18,23 @@ flowchart LR
     qwCloud["mqtt.qilowatt.it:8883 (TLS)"]
     subgraph cerbo [Cerbo GX]
         daemon["qw_agent.py<br/>(qilowatt-py)"]
+        sm["mfrr_statemachine.py<br/>IDLE / ACTIVE[frr|trade]"]
         dbus["Venus OS dbus<br/>com.victronenergy.*"]
-        localmq["local MQTT<br/>127.0.0.1:1883"]
-        nr["Node-RED<br/>mFRR state machine"]
         sh["/data/qw_*.sh"]
+        localmq["local MQTT<br/>127.0.0.1:1883 (optional)"]
+        nr["Node-RED<br/>curtailment / dashboard (optional)"]
     end
     qwCloud <-->|"WORKMODE in / SENSOR,STATE,STATUS0 out"| daemon
-    dbus -->|telemetry| daemon
-    daemon -->|"qw/qw_*"| localmq
-    localmq --> nr
-    nr -->|exec| sh
+    dbus -->|"telemetry, live SOC"| daemon
+    daemon --> sm
+    sm -->|"subprocess"| sh
     sh --> dbus
+    daemon -.->|"qw/qw_*, qw/mfrr_*"| localmq
+    localmq -.-> nr
 ```
+
+Both live sites (site A, site B) run this path. Node-RED is not part of the
+control loop; it is an optional consumer of the local bridge.
 
 ### qw_agent.py
 
@@ -36,49 +42,118 @@ Uses the official [`qilowatt-py`](https://github.com/qilowatt/qilowatt-py)
 `QilowattMQTTClient` + `InverterDevice`:
 
 - subscribes to `Q/{device_id}/cmnd/backlog`, parses `WORKMODE <json>` into a
-  `WorkModeCommand`, and republishes the decoded fields to the local broker;
+  `WorkModeCommand`, logs it (`WORKMODE received: {...}`; `tools/afrr_capture.sh`
+  tails that into the durable `/data/afrr-workmode.log`) and hands it to the
+  state machine;
 - publishes telemetry on the library's schedule: `Q/{device_id}/SENSOR` (~10 s),
-  `STATE` (~60 s), `STATUS0` (startup + hourly);
-- mirrors the cloud connection state to `qw/qw_connected` and a retained
-  `qw/online` Last-Will.
+  `STATE` (~60 s), `STATUS0` (startup + hourly), read from dbus through a
+  per-site profile (`dc_coupled` / `ac_coupled`);
+- runs the periodic `tick()` (failsafes, trade SOC target) and the
+  `ConnectionWatchdog` (restart on a dead or deaf session);
+- with `QW_LOCAL_BRIDGE=1`, republishes the decoded command and the event
+  state to a local broker for Node-RED / dashboards.
 
-### Local signal mapping
+### mfrr_statemachine.py
 
-| WorkModeCommand | Local topic        | Used by state machine for |
-|-----------------|--------------------|---------------------------|
-| `_source`       | `qw/qw_source`     | IDLE↔ACTIVE trigger (`fusebox`/`kratt`) |
-| `Mode`          | `qw/qw_mode`       | setpoint sign (`frrup` = export) and the mode gate |
-| `PowerLimit`    | `qw/qw_powerlimit` | setpoint magnitude (W); zero ends the event |
-| connection      | `qw/qw_connected`  | `mqtt_lost` failsafe |
+One `ACTIVE` state with two event *kinds*; both use the same actuator sequence
+(DESS off → settle 2 s → signed `AcPowerSetPoint` → on end: setpoint 0 → DESS on).
 
-### Node-RED state machine
+| Kind    | Opens on                                                           | Setpoint sign            | SOC floor                    |
+|---------|--------------------------------------------------------------------|--------------------------|------------------------------|
+| `frr`   | `_source ∈ QW_MFRR_SOURCES`, `Mode ∈ {frrup, frrdown}`, `PowerLimit ≠ 0` | `frrup` −, `frrdown` +   | lowered to `QW_MFRR_MIN_SOC` |
+| `trade` | `_source ∈ QW_TRADE_SOURCES`, `Mode ∈ QW_TRADE_MODES ⊆ {buy, sell}`, `PowerLimit ≠ 0` | `buy` +, `sell` −        | untouched (`off --no-floor`) |
 
-`IDLE → ACTIVE` on an mFRR source: DESS off, then (after 2 s) write the signed
-setpoint. `ACTIVE → ACTIVE` on power change: rewrite setpoint. `ACTIVE → IDLE` when
-the source clears: setpoint 0 + DESS on. Failsafes: connection lost > 5 min, or
-event > 30 min → release. It also maintains a `global.qw_mfrr` flag for a
-co-resident curtailment flow (see [`../nodered/curtailment-mfrr-aware.md`](../nodered/curtailment-mfrr-aware.md)).
+Gates, in order:
 
-The flow predates the Python agent's mode and power gates and does not mirror
-them, so it will hold a zero-power FRR command as a 0 W event. Both live sites
-run the Python agent; treat the flow as the older, coarser implementation.
+1. **Source gate** — strangers never reach the actuators.
+2. **Mode gate** — a trusted source speaks several dialects (`qilowatt` sends
+   `frrup`/`frrdown` *and* `buy`). Only the two FRR modes and the configured
+   trade modes are actuated; `savebattery`/`limitexport`/`normal`/… from any
+   source are dropped and end a running event.
+3. **Power gate** — a zero-power event Mode is the dispatcher's stand-down and
+   ends the event instead of being held as a 0 W dispatch.
+4. **Magnitude cap** — `|PowerLimit|` is capped to `QW_MAX_IMPORT_W` /
+   `QW_MAX_EXPORT_W` before the script sees it (the script's clamp *rejects*
+   and would leave the previous value in place).
+
+Transitions:
+
+- `IDLE → ACTIVE[kind]` on an event command.
+- `ACTIVE[k] → ACTIVE[k]` on a power change: rewrite the setpoint only.
+- `ACTIVE[frr] ↔ ACTIVE[trade]`: switch kind in place — setpoint rewritten, the
+  duration clock restarted, **no DESS on/off cycle** in between. Switching to
+  `frr` re-runs `qw_dess_toggle.sh off` (idempotent on the saved Mode) so the
+  SOC floor is lowered for the dispatch.
+- `ACTIVE → IDLE` on: non-event command, zero-power event Mode, QW link lost
+  `> QW_MQTT_LOST_FAILSAFE_S`, event `> QW_MAX_EVENT_S` (frr) or
+  `> QW_MAX_TRADE_S` (trade), a trade's live SOC (`com.victronenergy.system
+  /Dc/Battery/Soc`) reaching the command's `BatterySoc` (buy: `≥`, sell: `≤`),
+  or agent shutdown. A SOC read failure never ends a trade (fail-open toward
+  continuing; the caps cover it).
+
+Every START/END line names the kind and the trigger:
+`mFRR END (kratt/frrup 0 W)`, `TRADE END (trade target reached: SOC 100% >= 100%)`,
+`TRADE END (failsafe: event > 5400s)`.
 
 ### Actuators
 
 `/data/qw_*.sh` use the Venus `dbus` CLI to toggle DESS Mode and write
-`AcPowerSetPoint`, with an absolute setpoint clamp and a standalone watchdog.
+`AcPowerSetPoint`, with an absolute setpoint clamp and a standalone watchdog:
 
-## Why a Python daemon + Node-RED (not one or the other)
+- `qw_dess_toggle.sh off [--no-floor] | on | status` — atomic save/restore of
+  DESS Mode and (without `--no-floor`) the shared ESS minimum-SOC floor.
+- `qw_grid_setpoint.sh <signed W>` — asymmetric clamp, writes the setpoint.
+- `qw_dess_watchdog.sh` — cron/boot-loop backstop that forces DESS back on after
+  `QW_MAX_OFF_SECS` (must stay *above* both agent caps).
+- `qw_log_audit.sh` — hourly log review: crashes, failsafes, dropped commands,
+  foreign event ends, trade counts, command silence.
 
-- The Qilowatt protocol (TLS, `WORKMODE` parsing, mandatory `SENSOR`/`STATE`/`STATUS0`
-  telemetry schema) is best handled by the vendor library — reimplementing it in
-  Node-RED would mean tracking upstream changes by hand.
-- The decision logic and actuation are naturally a Node-RED job, and Node-RED is
-  typically already present for other site automation (load control, curtailment).
+### Local signal mapping (optional bridge)
+
+| Published            | Local topic          | Meaning                                              |
+|----------------------|----------------------|------------------------------------------------------|
+| `_source`            | `qw/qw_source`       | `fusebox` / `kratt` / `qilowatt` / `notimer` / …     |
+| `Mode`               | `qw/qw_mode`         | `frrup` / `frrdown` / `buy` / `sell` / `normal` / …  |
+| `PowerLimit`         | `qw/qw_powerlimit`   | requested magnitude (W)                              |
+| connection           | `qw/qw_connected`    | `on` / `off`                                         |
+| event state          | `qw/mfrr_active`     | `on` while ACTIVE (either kind) — curtailment stands down |
+| event kind           | `qw/mfrr_kind`       | `frr` / `trade` / `none`                             |
+| signed setpoint      | `qw/mfrr_signed_w`   | negative = export, positive = import                 |
+
+`mfrr_active` is `on` for trades as well: a `sell` is an export exactly like
+`frrup`, and holding PV at 100 % during a `buy` costs nothing. A flow that wants
+to behave differently per kind reads `mfrr_kind`.
+
+### Node-RED (optional, legacy flow)
+
+`nodered/flow.json` predates the Python state machine and implements a coarser
+IDLE/ACTIVE flow (no mode, power or trade handling; it holds a zero-power FRR
+command as a 0 W event). Do **not** run its actuator nodes alongside the agent —
+two orchestrators writing the same dbus paths will race. Its remaining use is the
+curtailment stand-down described in
+[`../nodered/curtailment-mfrr-aware.md`](../nodered/curtailment-mfrr-aware.md),
+driven by `qw/mfrr_active`.
+
+## Why a Python daemon (and why the vendor library)
+
+- The Qilowatt protocol (TLS, `WORKMODE` parsing, the mandatory
+  `SENSOR`/`STATE`/`STATUS0` telemetry schema) is best handled by the vendor
+  library — reimplementing it would mean tracking upstream changes by hand.
+- The decision logic is small, must be deterministic and testable (see
+  `tests/`), and needs failsafes that keep running when the broker is quiet —
+  a supervised Python process on a standard Venus OS image does that with no
+  Venus OS Large / Node-RED dependency.
 
 ## Telemetry source
 
-`dbus_telemetry.py` reads `com.victronenergy.*` and packs `EnergyData` /
-`MetricsData`. The exact field set Qilowatt expects should be validated against the
-live `SENSOR` payload for the target system — see the `VALIDATE` comments in that
-file.
+`agent/telemetry/base.py` reads `com.victronenergy.*` and packs `EnergyData` /
+`MetricsData`; `dc_coupled.py` / `ac_coupled.py` supply the PV-power source.
+The exact field set Qilowatt expects should be validated against the live
+`SENSOR` payload for the target system — see the `VALIDATE` comments there.
+
+## Diagnostics
+
+`tools/afrr_probe.py --log /data/afrr-workmode.log` classifies the captured
+WORKMODE stream (FRR / Q trade / unknown), measures FRR cadence (the aFRR tell),
+trade → FRR latency, and the command-silence distribution that bounds a safe
+`QW_IDLE_REFRESH_S`. See [`AFRR_VERIFICATION.md`](AFRR_VERIFICATION.md).

@@ -159,6 +159,35 @@ set_dbus "$MINSOC_PATH" 30.0
 env QW_STATE_DIR="$TMP/state" sh "$TARGET" on >/dev/null 2>&1
 assert_eq "owner's 30 kept on watchdog path" "30.0" "$(get_dbus "$MINSOC_PATH")"
 
+echo "=== scenario 10: off --no-floor drops DESS but never touches the floor ==="
+reset
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" off --no-floor >/dev/null 2>&1
+assert_eq "DESS Mode set OFF"             "0"    "$(get_dbus "$MODE_PATH")"
+assert_eq "saved mode is 1"               "1"    "$(cat "$SAVED_MODE" 2>/dev/null)"
+assert_eq "floor unchanged at 25 despite Y=20" "25.0" "$(get_dbus "$MINSOC_PATH")"
+assert_absent "no saved-floor file"       "$SAVED_MINSOC"
+assert_absent "no installed-floor file"   "$EVENT_MINSOC"
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" on >/dev/null 2>&1
+assert_eq "DESS Mode restored to 1"       "1"    "$(get_dbus "$MODE_PATH")"
+assert_eq "floor still 25 after on"       "25.0" "$(get_dbus "$MINSOC_PATH")"
+
+echo "=== scenario 11: trade then dispatch — plain off after --no-floor lowers the floor, keeps saved mode ==="
+reset
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" off --no-floor >/dev/null 2>&1
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" off >/dev/null 2>&1
+assert_eq "floor lowered to 20 on the 2nd off" "20" "$(get_dbus "$MINSOC_PATH")"
+assert_eq "saved floor is 25"             "25"   "$(cat "$SAVED_MINSOC" 2>/dev/null)"
+assert_eq "saved mode still the original 1" "1"  "$(cat "$SAVED_MODE" 2>/dev/null)"
+env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" on >/dev/null 2>&1
+assert_eq "floor restored to 25"          "25"   "$(get_dbus "$MINSOC_PATH")"
+assert_eq "DESS Mode restored to 1"       "1"    "$(get_dbus "$MODE_PATH")"
+
+echo "=== scenario 12: unknown off option is rejected ==="
+reset
+env QW_STATE_DIR="$TMP/state" sh "$TARGET" off --bogus >/dev/null 2>&1
+assert_eq "exit status 1"                 "1"    "$?"
+assert_eq "DESS Mode untouched"           "1"    "$(get_dbus "$MODE_PATH")"
+
 echo "-----------------------------------------"
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]

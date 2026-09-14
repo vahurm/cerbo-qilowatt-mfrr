@@ -9,10 +9,12 @@
 #
 # WHY: every defect this project has hit announced itself in the agent log and
 # was still missed for weeks, because nobody reads the log.
-#   * "ignoring non-FRR Mode"  — commands arriving and being dropped
+#   * "ignoring non-FRR Mode"  — commands arriving and being dropped (buy/sell
+#                                here means Q trades are disabled on this site)
 #   * "nothing to lower"       — the two-level SOC floor never engaging (Y >= X)
 #   * "FAILSAFE"               — an event truncated mid-delivery
-#   * a foreign mFRR END       — a third party writing our WorkMode channel
+#   * a foreign mFRR/TRADE END — a third party writing our WorkMode channel
+#   * "TRADE START"            — Q trades executed (informational count)
 #   * "no WORKMODE command"    — idle-refresh restarting the agent in a loop
 #   * "subscription dead"      — the zombie-subscription watchdog firing
 #   * "Traceback"              — the agent crashing and being restarted
@@ -115,7 +117,19 @@ report WARN "$(count 'no WORKMODE command received')" \
 report WARN "$(count 'link down for')" \
   "QW link stayed down past QW_LINK_RESTART_S"
 report WARN "$(count 'ignoring non-FRR Mode')" \
-  "commands from a trusted source were dropped by the mode gate (expected for Mode=buy)"
+  "commands from a trusted source were dropped by the mode gate — Mode=buy/sell here means Q trades are DISABLED (QW_TRADE_MODES); savebattery/limitexport/normal are dropped by design"
+
+# --- Q trades (informational) ----------------------------------------------- #
+# A trade is the vendor refilling the battery between mFRR activations. Its
+# START/END pairs should roughly match, and most ends should be either the SOC
+# target or the FRR dispatch that follows. Lots of trades with no FRR after them
+# is worth a look at the portal (is the site still being dispatched?).
+report INFO "$(count 'TRADE START')" \
+  "Q trades started (buy = import to the BatterySoc target, sell = export)"
+report INFO "$(count 'trade target reached')" \
+  "Q trades ended on the live SOC reaching the commanded target"
+report INFO "$(count 'capping ')" \
+  "requested PowerLimit was capped to QW_MAX_IMPORT_W / QW_MAX_EXPORT_W before dispatch"
 report WARN "$(count 'QW connect attempt')" \
   "initial QW connect failed and was retried (usually DNS not ready at boot)"
 
@@ -127,19 +141,25 @@ report WARN "$(count 'QW connect attempt')" \
 # Energy Optimizer truncated every event on both sites on 2026-07-27 while
 # looking, in the log, like a perfectly ordinary end of dispatch.
 if [ -n "$window" ]; then
-  # Only an FRR Mode at 0 W is a stand-down. A *non*-FRR Mode at 0 W is not
-  # exempt: that is precisely what the Optimizer's limitexport/savebattery
-  # looked like.
+  # Only an event Mode (frrup/frrdown, buy/sell) at 0 W is a stand-down. A
+  # *non*-event Mode at 0 W is not exempt: that is precisely what the
+  # Optimizer's limitexport/savebattery looked like. A trade ending on its SOC
+  # target is the agent's own doing. A `qilowatt/buy` ending an mFRR event can
+  # only happen with Q trades disabled — then it is a configuration finding,
+  # not interference, but still worth seeing.
   foreign=$(printf '%s\n' "$window" \
-    | grep 'mFRR END (' \
-    | grep -v 'mFRR END (notimer/' \
+    | grep -E '(mFRR|TRADE) END \(' \
+    | grep -v -E 'END \(notimer/' \
     | grep -v '/frrup 0 W)' \
     | grep -v '/frrdown 0 W)' \
+    | grep -v '/buy 0 W)' \
+    | grep -v '/sell 0 W)' \
+    | grep -v 'trade target reached' \
     | grep -v 'failsafe' \
     | grep -v 'agent shutdown' \
     | grep -c . 2>/dev/null || true)
   report WARN "$foreign" \
-    "an mFRR event was ended by a foreign automation writing the same WorkMode channel — grep 'mFRR END' to see which one"
+    "an event was ended by a foreign automation writing the same WorkMode channel — grep 'END (' to see which one (qilowatt/buy here = Q trades disabled)"
 fi
 
 restarts=$(count 'Starting qw_agent')

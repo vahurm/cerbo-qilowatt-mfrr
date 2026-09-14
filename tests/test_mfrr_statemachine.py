@@ -249,10 +249,14 @@ def test_non_frr_mode_from_mfrr_source_is_ignored(
     assert actuator.calls == []
 
 
-def test_buy_during_active_event_reverts_instead_of_setting_import(
+def test_buy_during_active_event_reverts_when_trades_are_disabled(
     actuator, clock, timers, make_command
 ):
-    ctrl = make_controller(actuator, mfrr_sources=("fusebox", "kratt", "qilowatt"))
+    """With QW_TRADE_MODES empty a buy is still a foreign Mode: it ends the
+    event rather than becoming a full-power import (pre-2026-09 behaviour)."""
+    ctrl = make_controller(
+        actuator, mfrr_sources=("fusebox", "kratt", "qilowatt"), trade_modes=()
+    )
     ctrl.on_workmode(make_command(source="qilowatt", mode="frrup", power=10000))
     timers.fire_pending()
     assert actuator.setpoints == [-10000]
@@ -283,6 +287,344 @@ def test_qilowatt_source_stays_ignored_when_not_configured(
     ctrl.on_workmode(make_command(source="qilowatt", mode="frrup", power=10000))
     assert ctrl.state == "IDLE"
     assert actuator.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# Q trades: `_source='qilowatt'` Mode buy/sell actuated as a `trade` event
+#
+# Live evidence (site A, 2026-07-14..09-14): `qilowatt`/`buy` (PowerLimit
+# 20-27 kW, BatterySoc 100) arrives 5-30 min after a `kratt`/`frrup` stand-down
+# and is followed 5-30 min later by the next frrup — the vendor refills the
+# battery between activations. Dropped, the next activation runs from the floor.
+# --------------------------------------------------------------------------- #
+
+TRADE_SOURCES = ("fusebox", "kratt", "qilowatt")
+
+
+def make_trade_controller(actuator, **kw):
+    params = dict(
+        mfrr_sources=TRADE_SOURCES,
+        trade_sources=("qilowatt",),
+        trade_modes=("buy", "sell"),
+        max_trade_s=5400.0,
+    )
+    params.update(kw)
+    return make_controller(actuator, **params)
+
+
+def test_buy_opens_a_trade_with_positive_setpoint_and_no_floor_change(
+    actuator, clock, timers, make_command
+):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000, BatterySoc=100))
+
+    assert ctrl.state == "ACTIVE"
+    assert ctrl.kind == "trade"
+    # DESS goes off but the SOC floor is left alone: a buy charges upward.
+    assert actuator.calls == [("dess_off", "--no-floor")]
+    timers.fire_pending()
+    assert actuator.setpoints == [27000]
+
+
+def test_sell_opens_a_trade_with_negative_setpoint(actuator, clock, timers, make_command):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="sell", power=8000, BatterySoc=20))
+    timers.fire_pending()
+    assert ctrl.kind == "trade"
+    assert actuator.setpoints == [-8000]
+
+
+def test_trade_is_capped_to_the_connection_limits(actuator, clock, timers, make_command):
+    """The setpoint script would REJECT 27 kW against a 15 kW cap and leave the
+    previous setpoint in place; the agent caps so something is delivered."""
+    ctrl = make_trade_controller(actuator, max_import_w=28000, max_export_w=15000)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="sell", power=27000))
+    timers.fire_pending()
+    assert actuator.setpoints == [-15000]
+
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    assert actuator.setpoints[-1] == 27000  # under the import cap: untouched
+
+
+def test_frr_is_capped_too_when_limits_are_configured(actuator, clock, timers, make_command):
+    ctrl = make_trade_controller(actuator, max_import_w=28000, max_export_w=15000)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=16000))
+    timers.fire_pending()
+    assert actuator.setpoints == [-15000]
+
+
+def test_no_limits_means_no_cap(actuator, clock, timers, make_command):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=99000))
+    timers.fire_pending()
+    assert actuator.setpoints == [99000]
+
+
+@pytest.mark.parametrize("mode", ["buy", "sell"])
+def test_zero_power_trade_is_a_stand_down(actuator, clock, timers, make_command, mode):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode=mode, power=0))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls == []
+
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=20000))
+    timers.fire_pending()
+    assert ctrl.state == "ACTIVE"
+    ctrl.on_workmode(make_command(source="qilowatt", mode=mode, power=0))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls[-2:] == [("set_setpoint", 0), ("dess_on",)]
+
+
+def test_trade_from_a_non_trade_source_is_dropped(actuator, clock, timers, make_command):
+    """`kratt`/`buy` never happens live; if it did it must not become an import."""
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="kratt", mode="buy", power=20000))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls == []
+
+
+@pytest.mark.parametrize("mode", ["savebattery", "limitexport", "normal", "pvsell", "nobattery"])
+def test_only_buy_and_sell_can_ever_be_trade_modes(actuator, clock, timers, make_command, mode):
+    """A misconfigured QW_TRADE_MODES must not widen the gate past buy/sell."""
+    ctrl = make_trade_controller(actuator, trade_modes=("buy", "sell", mode))
+    ctrl.on_workmode(make_command(source="qilowatt", mode=mode, power=20000))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls == []
+
+
+def test_trade_setpoint_update_does_not_toggle_dess(actuator, clock, timers, make_command):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=20000))
+    timers.fire_pending()
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    assert actuator.setpoints == [20000, 27000]
+    assert actuator.names().count("dess_off") == 1
+    assert "dess_on" not in actuator.names()
+
+
+def test_update_before_settle_timer_is_written_once_by_the_timer(
+    actuator, clock, timers, make_command
+):
+    """A second command inside the DESS-off settle window must not write the
+    setpoint early; the pending timer writes the latest value once."""
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=20000))
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    assert actuator.setpoints == []
+    timers.fire_pending()
+    assert actuator.setpoints == [27000]
+
+
+# --- FRR <-> trade transitions ---------------------------------------------- #
+
+def test_frr_dispatch_during_trade_switches_kind_without_dess_cycle(
+    actuator, clock, timers, make_command
+):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000, BatterySoc=100))
+    timers.fire_pending()
+    assert actuator.calls == [("dess_off", "--no-floor"), ("set_setpoint", 27000)]
+
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=15000))
+    assert ctrl.state == "ACTIVE"
+    assert ctrl.kind == "frr"
+    # No dess_on in between; the floor is lowered now that dispatch needs it.
+    assert actuator.calls[2:] == [("dess_off",), ("set_setpoint", -15000)]
+    assert "dess_on" not in actuator.names()
+
+
+def test_trade_during_frr_switches_kind_without_dess_cycle(
+    actuator, clock, timers, make_command
+):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=15000))
+    timers.fire_pending()
+
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000, BatterySoc=100))
+    assert ctrl.kind == "trade"
+    assert actuator.calls[2:] == [("set_setpoint", 27000)]
+    assert "dess_on" not in actuator.names()
+
+    # A later frrup stand-down ends the trade too: one WorkMode channel.
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=0))
+    assert ctrl.state == "IDLE"
+    assert actuator.calls[-2:] == [("set_setpoint", 0), ("dess_on",)]
+
+
+def test_kind_switch_restarts_the_duration_clock(actuator, clock, timers, make_command):
+    ctrl = make_trade_controller(actuator, max_duration_s=1800.0, max_trade_s=5400.0)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    timers.fire_pending()
+    clock.advance(1700)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=15000))
+    clock.advance(1000)  # 2700 s since the trade began, 1000 s since dispatch
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+    clock.advance(900)   # 1900 s since dispatch > 1800 s
+    ctrl.tick()
+    assert ctrl.state == "IDLE"
+
+
+def test_non_event_command_ends_a_trade(actuator, clock, timers, make_command, caplog):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    timers.fire_pending()
+    with caplog.at_level("INFO"):
+        ctrl.on_workmode(make_command(source="notimer", mode="normal", power=0))
+    assert ctrl.state == "IDLE"
+    end = [r.getMessage() for r in caplog.records if "TRADE END" in r.getMessage()]
+    assert len(end) == 1 and "notimer/normal" in end[0]
+
+
+# --- SOC target ---------------------------------------------------------------- #
+
+class _Soc:
+    def __init__(self, value):
+        self.value = value
+        self.reads = 0
+
+    def __call__(self):
+        self.reads += 1
+        if isinstance(self.value, Exception):
+            raise self.value
+        return self.value
+
+
+def test_buy_ends_when_live_soc_reaches_target(actuator, clock, timers, make_command, caplog):
+    soc = _Soc(60.0)
+    ctrl = make_trade_controller(actuator, soc_reader=soc)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000, BatterySoc=100))
+    timers.fire_pending()
+
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+    soc.value = 99.0
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+    soc.value = 100.0
+    with caplog.at_level("INFO"):
+        ctrl.tick()
+    assert ctrl.state == "IDLE"
+    assert actuator.calls[-2:] == [("set_setpoint", 0), ("dess_on",)]
+    end = [r.getMessage() for r in caplog.records if "TRADE END" in r.getMessage()]
+    assert len(end) == 1 and "SOC 100% >= 100%" in end[0]
+
+
+def test_sell_ends_when_live_soc_drops_to_target(actuator, clock, timers, make_command):
+    soc = _Soc(50.0)
+    ctrl = make_trade_controller(actuator, soc_reader=soc)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="sell", power=8000, BatterySoc=30))
+    timers.fire_pending()
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+    soc.value = 29.0
+    ctrl.tick()
+    assert ctrl.state == "IDLE"
+
+
+def test_trade_without_battery_soc_field_runs_until_command_or_cap(
+    actuator, clock, timers, make_command
+):
+    soc = _Soc(100.0)
+    ctrl = make_trade_controller(actuator, soc_reader=soc)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))  # no BatterySoc
+    timers.fire_pending()
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+    assert soc.reads == 0
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError("dbus down")])
+def test_soc_read_failure_never_ends_a_trade(actuator, clock, timers, make_command, failure):
+    """Fail-open toward continuing: the next command or the cap ends it."""
+    ctrl = make_trade_controller(actuator, soc_reader=_Soc(failure))
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000, BatterySoc=100))
+    timers.fire_pending()
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+
+
+def test_soc_target_is_not_applied_to_frr(actuator, clock, timers, make_command):
+    """frrup carries BatterySoc too (the floor, e.g. 6) — it is not a target."""
+    soc = _Soc(50.0)
+    ctrl = make_trade_controller(actuator, soc_reader=soc)
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=15000, BatterySoc=6))
+    timers.fire_pending()
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+    assert soc.reads == 0
+
+
+def test_kind_switch_to_frr_drops_the_trade_soc_target(actuator, clock, timers, make_command):
+    soc = _Soc(100.0)
+    ctrl = make_trade_controller(actuator, soc_reader=soc)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000, BatterySoc=100))
+    timers.fire_pending()
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=15000, BatterySoc=6))
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"  # SOC 100 >= 100 must not end the dispatch
+
+
+# --- Failsafes on trades ---------------------------------------------------- #
+
+def test_trade_has_its_own_duration_cap(actuator, clock, timers, make_command, caplog):
+    ctrl = make_trade_controller(actuator, max_duration_s=1800.0, max_trade_s=5400.0)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    timers.fire_pending()
+    clock.advance(1900)   # past the FRR cap, under the trade cap
+    ctrl.tick()
+    assert ctrl.state == "ACTIVE"
+    clock.advance(3600)   # 5500 s > 5400 s
+    with caplog.at_level("INFO"):
+        ctrl.tick()
+    assert ctrl.state == "IDLE"
+    end = [r.getMessage() for r in caplog.records if "TRADE END" in r.getMessage()]
+    assert len(end) == 1 and "failsafe: event > 5400" in end[0]
+
+
+def test_trade_reverts_when_mqtt_lost_too_long(actuator, clock, timers, make_command):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    timers.fire_pending()
+    ctrl.on_connected(False)
+    clock.advance(350)
+    ctrl.tick()
+    assert ctrl.state == "IDLE"
+    assert actuator.calls[-2:] == [("set_setpoint", 0), ("dess_on",)]
+
+
+def test_shutdown_during_trade_reverts(actuator, clock, timers, make_command):
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    timers.fire_pending()
+    ctrl.shutdown()
+    assert ctrl.state == "IDLE"
+    assert ctrl.kind is None
+    assert actuator.calls[-2:] == [("set_setpoint", 0), ("dess_on",)]
+
+
+def test_trade_start_and_end_logs_name_the_kind(actuator, clock, timers, make_command, caplog):
+    ctrl = make_trade_controller(actuator)
+    with caplog.at_level("INFO"):
+        ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000, BatterySoc=100))
+        timers.fire_pending()
+        ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=0))
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("TRADE START") and "until SOC 100%" in m for m in msgs)
+    assert any(m.startswith("TRADE END (qilowatt/buy 0 W)") for m in msgs)
+    assert not any("mFRR START" in m or "mFRR END" in m for m in msgs)
+
+
+def test_state_change_hook_fires_for_trades(actuator, clock, timers, make_command):
+    events = []
+    ctrl = make_trade_controller(actuator)
+    ctrl.on_state_change = lambda state, signed: events.append((state, signed, ctrl.kind))
+    ctrl.on_workmode(make_command(source="qilowatt", mode="buy", power=27000))
+    assert events[-1] == ("ACTIVE", 27000, "trade")
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=15000))
+    assert events[-1] == ("ACTIVE", -15000, "frr")
+    ctrl.on_workmode(make_command(source="kratt", mode="frrup", power=0))
+    assert events[-1] == ("IDLE", 0, None)
 
 
 # --------------------------------------------------------------------------- #

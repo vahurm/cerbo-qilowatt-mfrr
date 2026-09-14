@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-# qw_dess_toggle.sh — prepare / restore the system for an mFRR event
+# qw_dess_toggle.sh — prepare / restore the system for an mFRR event / Q trade
 # =============================================================================
 # Install to /data/qw_dess_toggle.sh (persists across Venus OS firmware updates).
 # Permissions: chmod 750
@@ -22,6 +22,14 @@
 #   qw_dess_toggle.sh off      -> save DESS Mode, set Mode=0; if QW_MFRR_MIN_SOC
 #                                 is set AND the live floor is higher, save the
 #                                 floor and lower it to QW_MFRR_MIN_SOC.
+#   qw_dess_toggle.sh off --no-floor
+#                              -> same, but never touch the SOC floor. Used for
+#                                 Q trades (buy/sell): a buy charges upward and
+#                                 needs no deeper floor; a sell must respect the
+#                                 owner's arbitrage floor. Idempotent: a later
+#                                 plain `off` (frr dispatch arriving mid-trade)
+#                                 lowers the floor without touching the saved
+#                                 DESS Mode.
 #   qw_dess_toggle.sh on       -> restore saved DESS Mode (default 1) and the
 #                                 saved SOC floor, UNLESS the floor no longer
 #                                 holds the Y we installed — see below.
@@ -135,9 +143,19 @@ restore_floor_after_event() {
 }
 
 action="${1:-status}"
+option="${2:-}"
 
 case "$action" in
   off)
+    touch_floor=1
+    case "$option" in
+      "") ;;
+      --no-floor) touch_floor=0 ;;
+      *)
+        echo "Usage: $0 off [--no-floor]" >&2
+        exit 1
+        ;;
+    esac
     current=$(dbus_get "$MODE_PATH")
     if [ -z "$current" ]; then
       log "ERROR: could not read DESS Mode from dbus $MODE_PATH"
@@ -152,7 +170,11 @@ case "$action" in
       log "Set DESS OFF (Mode=0)"
     fi
     # Lower the shared SOC floor so mFRR can discharge below the arbitrage floor.
-    lower_floor_for_event
+    if [ "$touch_floor" = "1" ]; then
+      lower_floor_for_event
+    else
+      log "SOC floor left untouched (--no-floor)"
+    fi
     date +%s > "$OFF_AT_FILE"
     exit 0
     ;;
@@ -200,7 +222,7 @@ case "$action" in
     ;;
 
   *)
-    echo "Usage: $0 {off|on|status}" >&2
+    echo "Usage: $0 {off [--no-floor]|on|status}" >&2
     exit 1
     ;;
 esac
