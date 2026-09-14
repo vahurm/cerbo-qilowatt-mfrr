@@ -92,9 +92,9 @@ def test_config_defaults(monkeypatch):
     assert cfg.mqtt_host == "mqtt.qilowatt.it"
     assert cfg.mqtt_port == 8883
     assert cfg.mqtt_tls is True
-    assert cfg.telemetry_profile == "dc_coupled"
+    assert cfg.telemetry_profile == "auto"
     assert cfg.export_limit_w == 15000.0
-    assert cfg.mfrr_sources == ("fusebox", "kratt")
+    assert cfg.mfrr_sources == ("fusebox", "kratt", "qilowatt")
     assert cfg.dry_run is False
     assert cfg.local_bridge is False
     assert cfg.link_restart_s == 600.0
@@ -269,3 +269,17 @@ def test_config_missing_required_exits(monkeypatch):
     _set_environ(monkeypatch, env)
     with pytest.raises(SystemExit):
         qw_agent.Config()
+
+
+def test_state_paths_defaults_and_overrides(monkeypatch):
+    _set_environ(monkeypatch, dict(REQUIRED))
+    cfg = qw_agent.Config()
+    assert cfg.state_dir == "/data"
+    assert cfg.state_file == "/data/qw-agent/state.json"
+
+    env = dict(REQUIRED)
+    env.update({"QW_STATE_DIR": "/tmp/x", "QW_STATE_FILE": ""})
+    _set_environ(monkeypatch, env)
+    cfg = qw_agent.Config()
+    assert cfg.state_dir == "/tmp/x"
+    assert cfg.state_file == ""      # empty disables state.json

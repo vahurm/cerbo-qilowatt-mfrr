@@ -755,3 +755,134 @@ def test_end_log_names_the_failsafe_that_ended_the_event(
     end = [r for r in caplog.records if "mFRR END" in r.getMessage()]
     assert len(end) == 1
     assert "failsafe" in end[0].getMessage()
+
+
+# --------------------------------------------------------------------------- #
+# Actuator read-back: retry once, then DEGRADED (A2)
+# --------------------------------------------------------------------------- #
+
+class _FlakyActuator:
+    """FakeActuator whose calls answer from a scripted list of results.
+
+    ``results[name]`` is a list consumed one entry per call; ``True``/``False``
+    is the read-back verdict. Exhausted lists answer ``True``.
+    """
+
+    def __init__(self, **results):
+        self.calls: list = []
+        self._results = {k: list(v) for k, v in results.items()}
+
+    def _answer(self, name):
+        q = self._results.get(name, [])
+        return q.pop(0) if q else True
+
+    def dess_off(self, lower_floor=True):
+        self.calls.append(("dess_off",) if lower_floor else ("dess_off", "--no-floor"))
+        return self._answer("dess_off")
+
+    def dess_on(self):
+        self.calls.append(("dess_on",))
+        return self._answer("dess_on")
+
+    def set_setpoint(self, watts):
+        self.calls.append(("set_setpoint", int(watts)))
+        return self._answer("set_setpoint")
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+
+def test_legacy_actuator_returning_none_is_not_degraded(actuator, clock, timers, make_command):
+    ctrl = make_controller(actuator)
+    ctrl.on_workmode(make_command(power=3000))
+    timers.fire_pending()
+    assert ctrl.degraded is False
+
+
+def test_failed_setpoint_is_retried_once_then_degraded(clock, timers, make_command, caplog):
+    act = _FlakyActuator(set_setpoint=[False, False])
+    ctrl = make_controller(act)
+    events = []
+    ctrl.on_state_change = lambda state, signed: events.append((state, signed, ctrl.degraded))
+
+    ctrl.on_workmode(make_command(power=3000))
+    with caplog.at_level("ERROR"):
+        timers.fire_pending()
+
+    assert act.calls == [("dess_off",), ("set_setpoint", 3000), ("set_setpoint", 3000)]
+    assert ctrl.state == "ACTIVE"          # event still tracked so the END command is honoured
+    assert ctrl.degraded is True
+    assert any("actuation failed: setpoint 3000 W" in r.message for r in caplog.records)
+    # The hook fired for the degraded flip as well.
+    assert events[-1] == ("ACTIVE", 3000, True)
+
+
+def test_transient_failure_recovers_on_retry(clock, timers, make_command):
+    act = _FlakyActuator(set_setpoint=[False, True])
+    ctrl = make_controller(act)
+    ctrl.on_workmode(make_command(power=3000))
+    timers.fire_pending()
+    assert act.calls[-2:] == [("set_setpoint", 3000), ("set_setpoint", 3000)]
+    assert ctrl.degraded is False
+
+
+def test_degraded_clears_on_next_confirmed_write(clock, timers, make_command):
+    act = _FlakyActuator(set_setpoint=[False, False])
+    ctrl = make_controller(act)
+    ctrl.on_workmode(make_command(power=3000))
+    timers.fire_pending()
+    assert ctrl.degraded is True
+
+    ctrl.on_workmode(make_command(power=4000))   # setpoint update, read-back ok
+    assert ctrl.degraded is False
+    assert act.calls[-1] == ("set_setpoint", 4000)
+
+
+def test_failed_dess_off_still_enters_active_and_flags(clock, timers, make_command):
+    act = _FlakyActuator(dess_off=[False, False])
+    ctrl = make_controller(act)
+    ctrl.on_workmode(make_command(power=3000))
+    assert ctrl.state == "ACTIVE"
+    assert ctrl.degraded is True
+    assert act.names()[:2] == ["dess_off", "dess_off"]
+
+
+def test_failed_revert_retries_and_logs(clock, timers, make_command, caplog):
+    act = _FlakyActuator(dess_on=[False, False])
+    ctrl = make_controller(act)
+    ctrl.on_workmode(make_command(power=3000))
+    timers.fire_pending()
+    with caplog.at_level("ERROR"):
+        ctrl.on_workmode(make_command(power=0))
+    assert ctrl.state == "IDLE"
+    assert act.calls[-3:] == [("set_setpoint", 0), ("dess_on",), ("dess_on",)]
+    assert ctrl.degraded is True
+    assert any("actuation failed: DESS on" in r.message for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# Dispatch from an unlisted source is dropped LOUDLY (B4)
+# --------------------------------------------------------------------------- #
+
+def test_frr_from_unlisted_source_is_dropped_with_warning(actuator, clock, timers, make_command, caplog):
+    ctrl = make_controller(actuator, mfrr_sources=("fusebox", "kratt"))
+    with caplog.at_level("WARNING"):
+        ctrl.on_workmode(make_command(source="qilowatt", mode="frrup", power=5000))
+    assert ctrl.state == "IDLE" and actuator.calls == []
+    assert any("dropping FRR dispatch from unlisted source 'qilowatt'" in r.message for r in caplog.records)
+
+
+def test_zero_power_frr_from_unlisted_source_is_silent(actuator, clock, timers, make_command, caplog):
+    ctrl = make_controller(actuator, mfrr_sources=("fusebox", "kratt"))
+    with caplog.at_level("WARNING"):
+        ctrl.on_workmode(make_command(source="qilowatt", mode="frrup", power=0))
+    assert not any("dropping FRR dispatch" in r.message for r in caplog.records)
+
+
+def test_default_sources_include_qilowatt(actuator, clock, timers, make_command):
+    from mfrr_statemachine import DEFAULT_MFRR_SOURCES
+
+    assert "qilowatt" in DEFAULT_MFRR_SOURCES
+    ctrl = MfrrController(actuator, dess_off_delay_s=2.0)
+    ctrl.on_workmode(make_command(source="qilowatt", mode="frrup", power=5000))
+    assert ctrl.state == "ACTIVE" and ctrl.kind == "frr"

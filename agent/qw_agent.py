@@ -30,9 +30,12 @@ import paho.mqtt.client as mqtt
 from qilowatt import InverterDevice, QilowattMQTTClient, WorkModeCommand
 
 from actuators import DryRunActuator, ScriptActuator
-from mfrr_statemachine import MfrrController
+from mfrr_statemachine import DEFAULT_MFRR_SOURCES, MfrrController
+from startup import config_warnings, recover_leftover_event
 from telemetry import DbusReader, get_profile
 from telemetry.base import SVC_SYSTEM
+
+__version__ = "1.0.0"
 
 _logger = logging.getLogger("qw_agent")
 
@@ -101,11 +104,19 @@ class Config:
         self.dry_run = _env_bool("QW_DRY_RUN", False)
         self.dess_script = os.environ.get("QW_DESS_TOGGLE_SCRIPT", "/data/qw_dess_toggle.sh")
         self.setpoint_script = os.environ.get("QW_GRID_SETPOINT_SCRIPT", "/data/qw_grid_setpoint.sh")
+        # Which `_source` values carry balancing dispatch. The default includes
+        # `qilowatt` itself: a site that is dispatched directly by the vendor
+        # (site B, 2026-07) otherwise drops every frrup/frrdown silently.
         self.mfrr_sources = tuple(
             s.strip().lower()
-            for s in os.environ.get("QW_MFRR_SOURCES", "fusebox,kratt").split(",")
+            for s in os.environ.get(
+                "QW_MFRR_SOURCES", ",".join(DEFAULT_MFRR_SOURCES)
+            ).split(",")
             if s.strip()
         )
+        # Where qw_dess_toggle.sh keeps its saved-state files (startup recovery).
+        self.state_dir = os.environ.get("QW_STATE_DIR", "/data")
+        self.state_file = os.environ.get("QW_STATE_FILE", "/data/qw-agent/state.json")
         self.mqtt_lost_failsafe_s = float(os.environ.get("QW_MQTT_LOST_FAILSAFE_S", "300"))
         # Cap on a single mFRR event. Guards the case the link stays up but the
         # return-to-normal command never arrives; the shorter link-loss and
@@ -184,7 +195,10 @@ class Config:
         self.connect_retry_s = float(os.environ.get("QW_CONNECT_RETRY_S", "5"))
 
         # Telemetry
-        self.telemetry_profile = os.environ.get("QW_TELEMETRY_PROFILE", "dc_coupled")
+        # `auto` sums every PV source com.victronenergy.system knows about
+        # (DC MPPTs + AC-out + AC-in PV inverters); the legacy topology names
+        # remain accepted. See telemetry/__init__.py.
+        self.telemetry_profile = os.environ.get("QW_TELEMETRY_PROFILE", "auto")
         self.export_limit_w = float(os.environ.get("QW_GRID_EXPORT_LIMIT_W", "15000"))
         self.telemetry_interval_s = float(os.environ.get("QW_TELEMETRY_INTERVAL_S", "5"))
 
@@ -248,7 +262,13 @@ class LocalBridge:
     def publish_connected(self, connected: bool) -> None:
         self._pub("qw_connected", "on" if connected else "off")
 
-    def publish_mfrr(self, state: str, signed_watts: int, kind: Optional[str] = None) -> None:
+    def publish_mfrr(
+        self,
+        state: str,
+        signed_watts: int,
+        kind: Optional[str] = None,
+        degraded: bool = False,
+    ) -> None:
         """Publish the derived event state for the curtailment flow.
 
         ``mfrr_active`` lets the Node-RED Huawei-curtailment flow stand down
@@ -257,11 +277,16 @@ class LocalBridge:
         a sell is an export like frrup, and holding PV at 100 % during a buy
         costs nothing. ``mfrr_kind`` (``frr`` / ``trade`` / ``none``) tells the
         two apart; ``mfrr_signed_w`` is informational (negative = export,
-        positive = import).
+        positive = import); ``mfrr_degraded`` is ``true`` while the last
+        actuator write could not be confirmed.
+
+        Topic names and payloads are a contract (tests/test_local_bridge_contract.py):
+        site B's curtailment flow consumes ``mfrr_active`` and ``online``.
         """
         self._pub("mfrr_active", "on" if state == "ACTIVE" else "off")
         self._pub("mfrr_kind", kind or "none")
         self._pub("mfrr_signed_w", str(int(signed_watts)))
+        self._pub("mfrr_degraded", "true" if degraded else "false")
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +294,16 @@ class LocalBridge:
 # --------------------------------------------------------------------------- #
 
 class TelemetryLoop(threading.Thread):
+    """Feeds ENERGY/METRICS to qilowatt-py from the Victron dbus.
+
+    Publishes nothing when the dbus (or the battery SOC on it) is unreadable:
+    an all-zero SENSOR would tell Qilowatt the battery is empty and the grid
+    idle, and the vendor optimises on that. Silence is the honest signal — the
+    device shows offline in the portal and the log says why once a minute.
+    """
+
+    UNAVAILABLE_LOG_INTERVAL_S = 60.0
+
     def __init__(
         self, cfg: Config, device: InverterDevice, profile, reader: Optional[DbusReader] = None
     ) -> None:
@@ -278,18 +313,52 @@ class TelemetryLoop(threading.Thread):
         self._profile = profile
         self._reader = reader if reader is not None else DbusReader()
         self._stop = threading.Event()
+        self._last_unavailable_log: Optional[float] = None
+        self.published = 0
+        self.skipped = 0
         if not self._reader.available:
-            _logger.warning("dbus not available — telemetry will report zeros")
+            _logger.warning("dbus not available — telemetry will NOT be published")
+
+    def _unavailable_reason(self) -> Optional[str]:
+        if not self._reader.available:
+            return "dbus not available"
+        if self._reader.get(SVC_SYSTEM, "/Dc/Battery/Soc", None) is None:
+            return "%s %s unreadable" % (SVC_SYSTEM, "/Dc/Battery/Soc")
+        return None
+
+    def update_once(self) -> bool:
+        """One telemetry cycle; True if a SENSOR payload was handed to qilowatt-py."""
+        reason = self._unavailable_reason()
+        if reason is not None:
+            self.skipped += 1
+            now = time.monotonic()
+            if (
+                self._last_unavailable_log is None
+                or now - self._last_unavailable_log >= self.UNAVAILABLE_LOG_INTERVAL_S
+            ):
+                self._last_unavailable_log = now
+                _logger.error(
+                    "telemetry unavailable (%s); SENSOR not published (%d skipped)",
+                    reason, self.skipped,
+                )
+            return False
+        try:
+            energy = self._profile.build_energy_data(self._reader, self._cfg.export_limit_w)
+            metrics = self._profile.build_metrics_data(self._reader, self._cfg.export_limit_w)
+            self._device.set_energy_data(energy)
+            self._device.set_metrics_data(metrics)
+        except Exception as exc:
+            _logger.error("telemetry update failed: %s", exc)
+            return False
+        if self._last_unavailable_log is not None:
+            _logger.info("telemetry available again after %d skipped cycles", self.skipped)
+            self._last_unavailable_log = None
+        self.published += 1
+        return True
 
     def run(self) -> None:
         while not self._stop.is_set():
-            try:
-                energy = self._profile.build_energy_data(self._reader, self._cfg.export_limit_w)
-                metrics = self._profile.build_metrics_data(self._reader, self._cfg.export_limit_w)
-                self._device.set_energy_data(energy)
-                self._device.set_metrics_data(metrics)
-            except Exception as exc:
-                _logger.error("telemetry update failed: %s", exc)
+            self.update_once()
             self._stop.wait(self._cfg.telemetry_interval_s)
 
     def stop(self) -> None:
@@ -465,6 +534,46 @@ def make_soc_reader(reader: DbusReader):
     return read_soc
 
 
+def read_install_version(path: str = "/data/qw-agent/VERSION") -> str:
+    """Contents of the VERSION stamp install.sh writes, or '-' when absent."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read().strip() or "-"
+    except OSError:
+        return "-"
+
+
+def write_state_file(path: str, controller: MfrrController, extra: Optional[Dict] = None) -> None:
+    """Atomically write the agent's current state as JSON (for doctor/dashboards).
+
+    Best effort: a failure to write never affects the state machine. Consumers
+    that cannot speak MQTT (Node-RED without a broker, a cron job, the doctor)
+    read this instead of the local bridge.
+    """
+    if not path:
+        return
+    import json
+
+    payload = {
+        "state": controller.state,
+        "kind": controller.kind,
+        "signed_w": controller.last_signed_watts,
+        "degraded": controller.degraded,
+        "updated_at": int(time.time()),
+        "version": __version__,
+    }
+    if extra:
+        payload.update(extra)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _logger.debug("state file %s not written: %s", path, exc)
+
+
 def connect_with_retry(
     client,
     attempts: int,
@@ -505,8 +614,9 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     _logger.info(
-        "Starting qw_agent device=%s profile=%s dry_run=%s local_bridge=%s",
-        cfg.device_id, cfg.telemetry_profile, cfg.dry_run, cfg.local_bridge,
+        "Starting qw_agent %s (install %s) device=%s profile=%s dry_run=%s local_bridge=%s",
+        __version__, read_install_version(), cfg.device_id, cfg.telemetry_profile,
+        cfg.dry_run, cfg.local_bridge,
     )
 
     profile = get_profile(cfg.telemetry_profile)
@@ -516,6 +626,14 @@ def main() -> int:
     )
     # One dbus reader shared by telemetry and the trade SOC-target check.
     reader = DbusReader()
+
+    # A previous process that died mid-event (crash, kill -9, reboot) leaves
+    # DESS off and the setpoint parked; return to normal before going online.
+    # In dry-run only the intent is logged.
+    recover_leftover_event(actuator, state_dir=cfg.state_dir)
+    for warn in config_warnings(cfg, reader):
+        _logger.warning("CONFIG WARN: %s", warn)
+
     controller = MfrrController(
         actuator,
         mfrr_sources=cfg.mfrr_sources,
@@ -547,23 +665,27 @@ def main() -> int:
         bridge.start()
         command_handlers.append(bridge.publish_workmode)
         connection_handlers.append(bridge.publish_connected)
+
+    def publish_state(state: str, signed: int) -> None:
         # Bridge the event state so the Node-RED curtailment flow stands down
-        # while the agent owns the grid setpoint. Publish a retained baseline
-        # immediately so the flow has a known state before the first event.
-        controller.on_state_change = (
-            lambda state, signed: bridge.publish_mfrr(state, signed, controller.kind)
+        # while the agent owns the grid setpoint, and mirror it to state.json
+        # for consumers without MQTT. Read kind/degraded from the controller
+        # so every publish carries the full picture.
+        if bridge is not None:
+            bridge.publish_mfrr(state, signed, controller.kind, controller.degraded)
+        write_state_file(cfg.state_file, controller)
+
+    controller.on_state_change = publish_state
+    # Republish the current state on every QW (re)connect so a retained
+    # baseline exists before the first event and survives reconnects. Read
+    # from the controller so a reconnect mid-event re-asserts "on", not "off".
+    connection_handlers.append(
+        lambda connected: (
+            publish_state(controller.state, controller.last_signed_watts)
+            if connected else None
         )
-        # Republish the current state on every QW (re)connect so a retained
-        # baseline exists before the first event and survives reconnects. Read
-        # from the controller so a reconnect mid-event re-asserts "on", not "off".
-        connection_handlers.append(
-            lambda connected: (
-                bridge.publish_mfrr(
-                    controller.state, controller.last_signed_watts, controller.kind
-                )
-                if connected else None
-            )
-        )
+    )
+    write_state_file(cfg.state_file, controller)
 
     device = InverterDevice(device_id=cfg.device_id)
 

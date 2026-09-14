@@ -1,18 +1,27 @@
 """mFRR actuators — drive the Cerbo via the /data/qw_*.sh scripts (or dry-run).
 
 The state machine calls a small interface (dess_off / dess_on / set_setpoint).
-`ScriptActuator` shells out to the shared shell scripts (same ones the HA and
-Node-RED solutions use). `DryRunActuator` only logs — used for the parallel /
-validation phase before cutover, where the agent runs without touching dbus.
+Each call returns ``True`` when the write was confirmed and ``False`` when it
+was rejected, failed, or reads back a different value. `ScriptActuator` shells
+out to the shared shell scripts and then READS BACK the register it just wrote:
+the setpoint clamp rejects out-of-range values (exit 3) and leaves the previous
+setpoint in place, and a dbus hiccup can swallow a write silently — in both
+cases the state machine used to believe the event was being delivered.
+`DryRunActuator` only logs — used for validation before cutover, where the
+agent runs without touching dbus.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
-from typing import List
+from typing import List, Optional, Tuple
 
 _logger = logging.getLogger("qw_agent.actuators")
+
+_SETPOINT_GET_RE = re.compile(r"AcPowerSetPoint\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)")
+_DESS_MODE_RE = re.compile(r"DESS Mode \(live\)\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)")
 
 
 class ScriptActuator:
@@ -23,12 +32,15 @@ class ScriptActuator:
         dess_script: str = "/data/qw_dess_toggle.sh",
         setpoint_script: str = "/data/qw_grid_setpoint.sh",
         timeout_s: float = 10.0,
+        verify: bool = True,
     ) -> None:
         self._dess = dess_script
         self._setpoint = setpoint_script
         self._timeout = timeout_s
+        self._verify = verify
 
-    def _run(self, cmd: List[str]) -> None:
+    def _run(self, cmd: List[str]) -> Tuple[bool, str]:
+        """Run a script; return (exit-ok, stdout). Never raises."""
         try:
             res = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=self._timeout
@@ -39,12 +51,28 @@ class ScriptActuator:
                 _logger.error(
                     "actuator %s exit %s: %s", cmd, res.returncode, err or out
                 )
-            else:
-                _logger.info("actuator %s -> %s", cmd, out)
+                return False, out
+            _logger.info("actuator %s -> %s", cmd, out)
+            return True, out
         except Exception as exc:
             _logger.error("actuator %s failed: %s", cmd, exc)
+            return False, ""
 
-    def dess_off(self, lower_floor: bool = True) -> None:
+    # --- read-backs --------------------------------------------------------- #
+    def read_setpoint(self) -> Optional[float]:
+        """Live AcPowerSetPoint via ``qw_grid_setpoint.sh get``; None if unknown."""
+        ok, out = self._run([self._setpoint, "get"])
+        m = _SETPOINT_GET_RE.search(out) if ok else None
+        return float(m.group(1)) if m else None
+
+    def read_dess_mode(self) -> Optional[float]:
+        """Live DESS Mode via ``qw_dess_toggle.sh status``; None if unknown."""
+        ok, out = self._run([self._dess, "status"])
+        m = _DESS_MODE_RE.search(out) if ok else None
+        return float(m.group(1)) if m else None
+
+    # --- actuation ---------------------------------------------------------- #
+    def dess_off(self, lower_floor: bool = True) -> bool:
         """Turn DESS off; ``lower_floor=False`` leaves the SOC floor alone.
 
         FRR dispatch lowers the shared ESS floor to QW_MFRR_MIN_SOC so frrup
@@ -54,23 +82,65 @@ class ScriptActuator:
         cmd = [self._dess, "off"]
         if not lower_floor:
             cmd.append("--no-floor")
-        self._run(cmd)
+        ok, _ = self._run(cmd)
+        if not ok:
+            return False
+        if not self._verify:
+            return True
+        mode = self.read_dess_mode()
+        if mode is None:
+            _logger.warning("DESS Mode could not be read back after 'off'; assuming ok")
+            return True
+        if mode != 0:
+            _logger.error("actuation failed: DESS Mode reads %s after 'off'", mode)
+            return False
+        return True
 
-    def dess_on(self) -> None:
-        self._run([self._dess, "on"])
+    def dess_on(self) -> bool:
+        ok, _ = self._run([self._dess, "on"])
+        if not ok:
+            return False
+        if not self._verify:
+            return True
+        mode = self.read_dess_mode()
+        if mode is None:
+            _logger.warning("DESS Mode could not be read back after 'on'; assuming ok")
+            return True
+        if mode == 0:
+            _logger.error("actuation failed: DESS Mode still 0 after 'on'")
+            return False
+        return True
 
-    def set_setpoint(self, watts: int) -> None:
-        self._run([self._setpoint, str(int(watts))])
+    def set_setpoint(self, watts: int) -> bool:
+        target = int(watts)
+        ok, _ = self._run([self._setpoint, str(target)])
+        if not ok:
+            return False
+        if not self._verify:
+            return True
+        live = self.read_setpoint()
+        if live is None:
+            _logger.warning("setpoint could not be read back after write; assuming ok")
+            return True
+        if abs(live - target) > 1.0:
+            _logger.error(
+                "actuation failed: setpoint reads %s W after writing %s W", live, target
+            )
+            return False
+        return True
 
 
 class DryRunActuator:
     """Logs intended actions without touching the system (validation phase)."""
 
-    def dess_off(self, lower_floor: bool = True) -> None:
+    def dess_off(self, lower_floor: bool = True) -> bool:
         _logger.info("[dry-run] DESS off%s", "" if lower_floor else " (--no-floor)")
+        return True
 
-    def dess_on(self) -> None:
+    def dess_on(self) -> bool:
         _logger.info("[dry-run] DESS on")
+        return True
 
-    def set_setpoint(self, watts: int) -> None:
+    def set_setpoint(self, watts: int) -> bool:
         _logger.info("[dry-run] grid setpoint %s W", int(watts))
+        return True

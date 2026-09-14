@@ -251,6 +251,98 @@ say "2026-09-14 10:00:00 INFO qw_agent.mfrr: mFRR END (qilowatt/buy 27000 W): gr
 out=$(run)
 assert_contains "trades-disabled hint" "Q trades disabled" "$out"
 
+echo "=== scenario 18: actuation failed / telemetry unavailable are ERRORs ==="
+reset
+say "2026-09-14 10:00:00 ERROR qw_agent.mfrr: actuation failed: setpoint 3000 W (after retry) -> DEGRADED"
+out=$(run)
+assert_contains "actuation failed reported" "ERROR x1 — an actuator write did not read back" "$out"
+reset
+say "2026-09-14 10:00:00 ERROR qw_agent: telemetry unavailable (dbus not available); SENSOR not published (12 skipped)"
+out=$(run)
+assert_contains "telemetry unavailable reported" "ERROR x1 — dbus/SOC unreadable" "$out"
+reset
+say "2026-09-14 10:00:00 ERROR qw_agent: telemetry unavailable (dbus not available); SENSOR not published (12 skipped)"
+assert_eq "exit 1 on telemetry unavailable" "1" "$(run_rc)"
+
+echo "=== scenario 19: startup recovery / config warn / dropped dispatch are WARNs ==="
+reset
+say "2026-09-14 10:00:00 WARNING qw_agent.startup: STARTUP RECOVERY: previous run left an event open (saved DESS Mode 1) -> setpoint 0, DESS on"
+say "2026-09-14 10:00:01 WARNING qw_agent: CONFIG WARN: QW_MAX_IMPORT_W/QW_MAX_EXPORT_W not set"
+say "2026-09-14 10:00:02 WARNING qw_agent.mfrr: dropping FRR dispatch from unlisted source 'qilowatt' (Mode 'frrup', 5000 W)"
+out=$(run)
+assert_contains "startup recovery reported" "WARN x1 — the agent found DESS off" "$out"
+assert_contains "config warn reported" "WARN x1 — start-up configuration check" "$out"
+assert_contains "dropped dispatch reported" "WARN x1 — frrup/frrdown arrived from a source NOT in QW_MFRR_SOURCES" "$out"
+
+echo "=== scenario 20: trades without any mFRR dispatch in the window ==="
+reset
+i=0
+while [ $i -lt 3 ]; do
+  say "2026-09-14 1$i:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 20000 W after 2s (until SOC 100%)"
+  i=$((i + 1))
+done
+out=$(run)
+assert_contains "trades w/o FRR warned" "WARN x3 — Q trades started but NO mFRR dispatch" "$out"
+reset
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 20000 W after 2s"
+say "2026-09-14 11:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 20000 W after 2s"
+say "2026-09-14 12:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 20000 W after 2s"
+say "2026-09-14 12:30:00 INFO qw_agent.mfrr: mFRR START: DESS off, then -12000 W after 2s"
+out=$(run)
+assert_missing "trades followed by FRR not warned" "NO mFRR dispatch" "$out"
+reset
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 20000 W after 2s"
+out=$(run)
+assert_missing "single trade not warned" "NO mFRR dispatch" "$out"
+
+echo "=== scenario 21: QW_ALERT_URL posts WARN/ERROR findings via curl (stubbed) ==="
+cat > "$TMP/curl" <<'CURLSTUB'
+#!/bin/sh
+# record the URL (last non-option arg) and the --data-binary body
+url=""; body=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --data-binary) body="$2"; shift ;;
+    -m|-X|-H) shift ;;
+    -*) ;;
+    *) url="$1" ;;
+  esac
+  shift
+done
+printf '%s\n' "$url" > "$CURL_LOG.url"
+printf '%s' "$body" > "$CURL_LOG.body"
+exit 0
+CURLSTUB
+chmod +x "$TMP/curl"
+CURL_LOG="$TMP/curl_log"; export CURL_LOG
+reset
+rm -f "$CURL_LOG.url" "$CURL_LOG.body"
+say "2026-09-14 10:00:00 WARNING qw_agent.mfrr: FAILSAFE: frr event > 7200s -> revert"
+out=$(run QW_ALERT_URL=https://ntfy.example/qw)
+assert_contains "alert sent" "alert sent to QW_ALERT_URL" "$out"
+assert_eq "posted to the url" "https://ntfy.example/qw" "$(cat "$CURL_LOG.url" 2>/dev/null)"
+assert_contains "body carries the finding" "ERROR x1 — failsafe reverted an event" "$(cat "$CURL_LOG.body" 2>/dev/null)"
+reset
+rm -f "$CURL_LOG.url"
+say "2026-09-14 10:00:00 INFO qw_agent.mfrr: TRADE START: DESS off, then 20000 W after 2s"
+out=$(run QW_ALERT_URL=https://ntfy.example/qw)
+assert_missing "no alert for INFO-only" "alert sent" "$out"
+if [ -f "$CURL_LOG.url" ]; then
+  fail=$((fail + 1)); echo "FAIL - curl called for INFO-only"
+else
+  pass=$((pass + 1)); echo "ok   - curl not called for INFO-only"
+fi
+reset
+say "2026-09-14 10:00:00 WARNING qw_agent.mfrr: FAILSAFE: frr event > 7200s -> revert"
+out=$(run)
+assert_missing "no alert without url" "QW_ALERT_URL" "$out"
+reset
+printf 'QW_ALERT_URL="https://hooks.example/x"\n' > "$TMP/agent.env"
+rm -f "$CURL_LOG.url"
+say "2026-09-14 10:00:00 WARNING qw_agent.mfrr: FAILSAFE: frr event > 7200s -> revert"
+out=$(run QW_AGENT_ENV="$TMP/agent.env")
+assert_eq "url read from env file" "https://hooks.example/x" "$(cat "$CURL_LOG.url" 2>/dev/null)"
+
 echo "-----------------------------------------"
 echo "passed: $pass   failed: $fail"
 [ "$fail" -eq 0 ]

@@ -67,7 +67,11 @@ from qilowatt import WorkModeCommand
 
 _logger = logging.getLogger("qw_agent.mfrr")
 
-DEFAULT_MFRR_SOURCES = ("fusebox", "kratt")
+# `_source` values whose frrup/frrdown is balancing dispatch. `qilowatt` is
+# included: the vendor dispatches some sites directly (site B, 2026-07) and a
+# default that drops those would silently deliver nothing. The Mode gate below
+# still keeps `qilowatt`'s non-FRR Modes out of the actuators.
+DEFAULT_MFRR_SOURCES = ("fusebox", "kratt", "qilowatt")
 
 # The only Modes that carry a balancing setpoint. Deliberately not
 # env-configurable: it is the hard guard that keeps a non-FRR Mode from a
@@ -139,6 +143,11 @@ class MfrrController:
         self._pending_timer: Optional[threading.Timer] = None
         # Token guards the delayed setpoint against a race with event end.
         self._token = 0
+        # True once an actuator write failed its read-back even after a retry:
+        # the machine still tracks the event (so the end command is honoured)
+        # but the site is NOT delivering what it claims. Cleared on the next
+        # confirmed write. Surfaced via `degraded` + the on_state_change hook.
+        self._degraded = False
 
     # ------------------------------------------------------------------ #
     # Inputs
@@ -175,6 +184,15 @@ class MfrrController:
                 "%s Mode %r carries 0 W -> stand-down, not a 0 W dispatch",
                 source,
                 mode,
+            )
+        elif mode in FRR_MODES and power != 0 and source not in self._sources:
+            # A real dispatch from a source the operator did not list. Loud on
+            # purpose: on a site dispatched by a source missing from
+            # QW_MFRR_SOURCES every activation would otherwise vanish silently.
+            _logger.warning(
+                "dropping FRR dispatch from unlisted source %r (Mode %r, %s W) — "
+                "add it to QW_MFRR_SOURCES if it is your dispatcher",
+                source, mode, power,
             )
         elif (source in self._sources or source in self._trade_sources) and not is_event_mode:
             _logger.info(
@@ -255,9 +273,41 @@ class MfrrController:
         with self._lock:
             return self._last_signed_watts
 
+    @property
+    def degraded(self) -> bool:
+        """True while the last actuator write could not be confirmed."""
+        with self._lock:
+            return self._degraded
+
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    def _actuate(self, what: str, fn: Callable[..., object], *args, **kwargs) -> bool:
+        """Call an actuator method, retry once on a failed read-back.
+
+        Actuators return ``True``/``False``; ``None`` (legacy/fake actuators
+        without read-back) counts as success. A second failure logs
+        ``actuation failed`` (the audit pattern) and raises the degraded flag;
+        the event state itself is unchanged so the eventual end command, the
+        duration cap and the DESS watchdog still get to clean up.
+        """
+        ok = fn(*args, **kwargs) is not False
+        if not ok:
+            _logger.warning("actuator %s not confirmed; retrying once", what)
+            ok = fn(*args, **kwargs) is not False
+        if not ok:
+            if not self._degraded:
+                self._degraded = True
+                _logger.error("actuation failed: %s (after retry) -> DEGRADED", what)
+                self._notify()
+            else:
+                _logger.error("actuation failed: %s (after retry)", what)
+        elif self._degraded:
+            self._degraded = False
+            _logger.info("actuator %s confirmed -> degraded cleared", what)
+            self._notify()
+        return ok
+
     def _cap(self, power: int, export: bool) -> int:
         limit = self._max_export_w if export else self._max_import_w
         magnitude = abs(power)
@@ -334,10 +384,10 @@ class MfrrController:
                 if kind == KIND_FRR:
                     # The trade opened DESS-off without lowering the SOC floor;
                     # dispatch needs it. `off` is idempotent on the saved Mode.
-                    self._act.dess_off(lower_floor=True)
+                    self._actuate("DESS off (floor)", self._act.dess_off, lower_floor=True)
                 if self._pending_timer is None:
                     self._last_signed_watts = signed
-                    self._act.set_setpoint(signed)
+                    self._actuate("setpoint %s W" % signed, self._act.set_setpoint, signed)
                 else:
                     # Settle timer still pending: let it write the new value.
                     self._last_signed_watts = signed
@@ -348,7 +398,7 @@ class MfrrController:
                 self._last_signed_watts = signed
                 _logger.info("%s setpoint update: %s W", self._label(kind), signed)
                 if self._pending_timer is None:
-                    self._act.set_setpoint(signed)
+                    self._actuate("setpoint %s W" % signed, self._act.set_setpoint, signed)
                 self._notify()
         elif self._state == "ACTIVE" and not is_event:
             self._revert(reason)
@@ -371,7 +421,9 @@ class MfrrController:
             self._label(kind), signed, self._dess_off_delay_s, target,
         )
         # Only FRR dispatch lowers the shared SOC floor; a trade leaves it alone.
-        self._act.dess_off(lower_floor=(kind == KIND_FRR))
+        self._actuate(
+            "DESS off", self._act.dess_off, lower_floor=(kind == KIND_FRR)
+        )
         # Apply the setpoint after the DESS-off settle delay, guarded by token.
         timer = threading.Timer(
             self._dess_off_delay_s, self._apply_delayed_setpoint, args=(token,)
@@ -386,7 +438,11 @@ class MfrrController:
             if self._state != "ACTIVE" or token != self._token:
                 return
             self._pending_timer = None
-            self._act.set_setpoint(self._last_signed_watts)
+            self._actuate(
+                "setpoint %s W" % self._last_signed_watts,
+                self._act.set_setpoint,
+                self._last_signed_watts,
+            )
 
     def _revert(self, reason: str = "") -> None:
         label = self._label(self._kind)
@@ -407,8 +463,8 @@ class MfrrController:
             "%s END (%s): grid setpoint 0, DESS on", label, reason or "reason unrecorded"
         )
         # Release the setpoint before restoring DESS so they don't fight.
-        self._act.set_setpoint(0)
-        self._act.dess_on()
+        self._actuate("setpoint 0 W", self._act.set_setpoint, 0)
+        self._actuate("DESS on", self._act.dess_on)
         self._notify()
 
 
