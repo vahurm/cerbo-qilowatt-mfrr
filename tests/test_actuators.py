@@ -49,11 +49,11 @@ class _FakeScripts:
             if arg == "off":
                 if not self.stuck:
                     self.dess_mode = 0
-                return self._ok("DESS Mode 1 -> 0")
+                return self._ok("[ts] Set DESS OFF (Mode=0), live now %s" % self.dess_mode)
             if arg == "on":
                 if not self.stuck:
                     self.dess_mode = 1
-                return self._ok("DESS Mode 0 -> 1")
+                return self._ok("[ts] Restored DESS Mode = 1, live now %s" % self.dess_mode)
         return self._fail(1, "unknown")
 
     @staticmethod
@@ -123,12 +123,36 @@ def test_set_setpoint_coerces_float_to_int(scripts, actuator):
 # read-back verification (A2)
 # --------------------------------------------------------------------------- #
 
-def test_setpoint_write_is_read_back(scripts, actuator):
+def test_setpoint_verified_from_the_write_output_without_extra_call(scripts, actuator):
+    """The script echoes 'old -> new W' after re-reading; no second call needed."""
     actuator.set_setpoint(3000)
-    # write, then `get`
-    assert scripts.calls == [
+    assert scripts.calls == [["/data/qw_grid_setpoint.sh", "3000"]]
+
+
+def test_dess_verified_from_the_write_output_without_extra_call(scripts, actuator):
+    actuator.dess_off()
+    actuator.dess_on()
+    assert scripts.calls == [["/data/qw_dess_toggle.sh", "off"], ["/data/qw_dess_toggle.sh", "on"]]
+
+
+def test_falls_back_to_get_and_status_when_output_lacks_the_value(monkeypatch, actuator):
+    """Older script versions print no live value: an explicit read is made."""
+    class _Terse(_FakeScripts):
+        def __call__(self, cmd, **kwargs):
+            res = super().__call__(cmd, **kwargs)
+            if cmd[1] not in ("get", "status"):
+                res.stdout = "done"
+            return res
+
+    fake = _Terse()
+    monkeypatch.setattr(actuators.subprocess, "run", fake)
+    assert actuator.set_setpoint(3000) is True
+    assert actuator.dess_off() is True
+    assert fake.calls == [
         ["/data/qw_grid_setpoint.sh", "3000"],
         ["/data/qw_grid_setpoint.sh", "get"],
+        ["/data/qw_dess_toggle.sh", "off"],
+        ["/data/qw_dess_toggle.sh", "status"],
     ]
 
 

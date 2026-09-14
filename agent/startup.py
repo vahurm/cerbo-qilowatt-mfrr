@@ -24,12 +24,28 @@ DEFAULT_WATCHDOG_MAX_OFF_S = 7800.0
 # qw_grid_setpoint.sh's built-in per-direction limits (pinned by a test).
 SCRIPT_DEFAULT_LIMIT_W = 15000.0
 
-# Live ESS SOC floor (the one qw_dess_toggle.sh lowers for FRR).
+# Live ESS SOC floor (the one qw_dess_toggle.sh lowers for FRR) and DESS Mode.
 SVC_SETTINGS = "com.victronenergy.settings"
 PATH_MIN_SOC = "/Settings/CGwacs/BatteryLife/MinimumSocLimit"
+PATH_DESS_MODE = "/Settings/DynamicEss/Mode"
 
 
-def leftover_event(state_dir: str = DEFAULT_STATE_DIR, off_at_file: str = DEFAULT_OFF_AT_FILE) -> Optional[str]:
+def read_dess_mode(reader) -> Optional[float]:
+    """Live DESS Mode via the dbus reader, or None when unavailable."""
+    if reader is None or not getattr(reader, "available", False):
+        return None
+    value = reader.get(SVC_SETTINGS, PATH_DESS_MODE, None)
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def leftover_event(
+    state_dir: str = DEFAULT_STATE_DIR,
+    off_at_file: str = DEFAULT_OFF_AT_FILE,
+    dess_mode: Optional[float] = None,
+) -> Optional[str]:
     """Describe a DESS-off left behind by a previous process, or None.
 
     A clean stop reverts the event (``MfrrController.shutdown``) and the
@@ -38,35 +54,81 @@ def leftover_event(state_dir: str = DEFAULT_STATE_DIR, off_at_file: str = DEFAUL
     reboot, the off-at stamp on /tmp does not — which is exactly the case the
     watchdog cannot see (it keys on the /tmp stamp), so DESS would stay off
     for good and the grid setpoint would stay parked.
+
+    Evidence, any one of which triggers a recovery:
+      * the off-at stamp exists (DESS was switched off and never back on);
+      * a saved SOC floor exists (the floor is still lowered);
+      * a saved Mode exists and the live DESS Mode is 0 — or cannot be read.
+    A saved Mode alone with DESS live at 1 is a stale file from a toggle-script
+    version that did not clean up on ``on``; it is reported as stale, not as
+    an event.
     """
     parts: List[str] = []
     saved_mode = os.path.join(state_dir, SAVED_MODE_FILE)
     saved_floor = os.path.join(state_dir, SAVED_MINSOC_FILE)
-    if os.path.isfile(saved_mode):
-        parts.append("saved DESS Mode %s" % _read(saved_mode))
-    if os.path.isfile(saved_floor):
-        parts.append("saved SOC floor %s%%" % _read(saved_floor))
-    if os.path.isfile(off_at_file):
+    have_mode, have_floor, have_stamp = (
+        os.path.isfile(saved_mode), os.path.isfile(saved_floor), os.path.isfile(off_at_file)
+    )
+    if have_stamp:
         try:
             age = int(time.time() - float(_read(off_at_file)))
             parts.append("DESS off for %ds" % age)
         except ValueError:
             parts.append("DESS off-at stamp present")
+    if have_floor:
+        parts.append("saved SOC floor %s%%" % _read(saved_floor))
+    if have_mode:
+        if have_stamp or have_floor or dess_mode is None or dess_mode == 0:
+            parts.append(
+                "saved DESS Mode %s (live Mode %s)"
+                % (_read(saved_mode), "unreadable" if dess_mode is None else int(dess_mode))
+            )
+        else:
+            return None  # stale file, DESS is on: nothing to recover
     return ", ".join(parts) if parts else None
+
+
+def stale_saved_mode(
+    state_dir: str = DEFAULT_STATE_DIR,
+    off_at_file: str = DEFAULT_OFF_AT_FILE,
+    dess_mode: Optional[float] = None,
+) -> Optional[str]:
+    """Path of a saved-Mode file that describes no open event, else None."""
+    saved_mode = os.path.join(state_dir, SAVED_MODE_FILE)
+    if not os.path.isfile(saved_mode):
+        return None
+    if os.path.isfile(off_at_file) or os.path.isfile(os.path.join(state_dir, SAVED_MINSOC_FILE)):
+        return None
+    if dess_mode is None or dess_mode == 0:
+        return None
+    return saved_mode
 
 
 def recover_leftover_event(
     actuator,
     state_dir: str = DEFAULT_STATE_DIR,
     off_at_file: str = DEFAULT_OFF_AT_FILE,
+    dess_mode: Optional[float] = None,
 ) -> bool:
     """Return the site to normal if a previous run died mid-event.
 
     Safe default: setpoint 0 and DESS back on. If the event is in fact still
     running, the post-connect WORKMODE snapshot (~20 s later) reopens it.
+    ``dess_mode`` is the live ``/Settings/DynamicEss/Mode`` (None = unknown).
     Returns True when a recovery was performed.
     """
-    found = leftover_event(state_dir, off_at_file)
+    stale = stale_saved_mode(state_dir, off_at_file, dess_mode)
+    if stale is not None:
+        _logger.info(
+            "removing stale %s (DESS is on, no off-at stamp): left by an older "
+            "qw_dess_toggle.sh that did not clean up on 'on'", stale,
+        )
+        try:
+            os.remove(stale)
+        except OSError as exc:
+            _logger.warning("could not remove %s: %s", stale, exc)
+        return False
+    found = leftover_event(state_dir, off_at_file, dess_mode)
     if not found:
         return False
     _logger.warning(

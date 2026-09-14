@@ -170,8 +170,12 @@ charges.
    first case within `QW_MAX_OFF_SECS`, but not a reboot: its stamp lives on
    `/tmp` and is gone, while the saved DESS Mode on `/data` and the Mode=0
    setting persist — DESS would stay off indefinitely. At start the agent
-   checks the toggle script's state files and, if any exist, writes setpoint 0
-   and DESS on before connecting (`STARTUP RECOVERY`). If the event is in fact
+   checks the toggle script's state files against the live DESS Mode and, if
+   they show an unfinished event (off-at stamp, saved SOC floor, or saved Mode
+   with DESS still 0), writes setpoint 0 and DESS on before connecting
+   (`STARTUP RECOVERY`). A saved Mode with DESS already on is a stale file from
+   an older toggle script and is removed instead; `on` now cleans up after
+   itself. If the event is in fact
    still running, the portal's post-connect snapshot reopens it ~20 s later.
 
 9. **Telemetry guard** — with dbus unavailable or `/Dc/Battery/Soc` unreadable

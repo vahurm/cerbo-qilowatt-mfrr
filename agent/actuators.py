@@ -21,7 +21,12 @@ from typing import List, Optional, Tuple
 _logger = logging.getLogger("qw_agent.actuators")
 
 _SETPOINT_GET_RE = re.compile(r"AcPowerSetPoint\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)")
+# qw_grid_setpoint.sh re-reads the register after writing and prints
+# "AcPowerSetPoint: <old> -> <new> W"; <new> IS the read-back.
+_SETPOINT_WRITE_RE = re.compile(r"AcPowerSetPoint:\s*-?[0-9.]+\s*->\s*(-?[0-9]+(?:\.[0-9]+)?)\s*W")
 _DESS_MODE_RE = re.compile(r"DESS Mode \(live\)\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)")
+# qw_dess_toggle.sh off/on re-read the Mode and print "..., live now <mode>".
+_DESS_LIVE_RE = re.compile(r"live now (-?[0-9]+(?:\.[0-9]+)?)")
 
 
 class ScriptActuator:
@@ -71,6 +76,31 @@ class ScriptActuator:
         m = _DESS_MODE_RE.search(out) if ok else None
         return float(m.group(1)) if m else None
 
+    @staticmethod
+    def _first_float(regex, text: str) -> Optional[float]:
+        m = regex.search(text or "")
+        return float(m.group(1)) if m else None
+
+    def _verify_dess(self, out: str, want_off: bool, what: str) -> bool:
+        """Confirm the DESS Mode from the script's own output, else `status`.
+
+        Each script call costs ~2 s on a Cerbo (the dbus CLI is slow), so the
+        write's echoed live value is preferred over a second invocation.
+        """
+        mode = self._first_float(_DESS_LIVE_RE, out)
+        if mode is None:
+            mode = self.read_dess_mode()
+        if mode is None:
+            _logger.warning("DESS Mode could not be read back after '%s'; assuming ok", what)
+            return True
+        if want_off and mode != 0:
+            _logger.error("actuation failed: DESS Mode reads %s after 'off'", mode)
+            return False
+        if not want_off and mode == 0:
+            _logger.error("actuation failed: DESS Mode still 0 after 'on'")
+            return False
+        return True
+
     # --- actuation ---------------------------------------------------------- #
     def dess_off(self, lower_floor: bool = True) -> bool:
         """Turn DESS off; ``lower_floor=False`` leaves the SOC floor alone.
@@ -82,43 +112,31 @@ class ScriptActuator:
         cmd = [self._dess, "off"]
         if not lower_floor:
             cmd.append("--no-floor")
-        ok, _ = self._run(cmd)
+        ok, out = self._run(cmd)
         if not ok:
             return False
         if not self._verify:
             return True
-        mode = self.read_dess_mode()
-        if mode is None:
-            _logger.warning("DESS Mode could not be read back after 'off'; assuming ok")
-            return True
-        if mode != 0:
-            _logger.error("actuation failed: DESS Mode reads %s after 'off'", mode)
-            return False
-        return True
+        return self._verify_dess(out, want_off=True, what="off")
 
     def dess_on(self) -> bool:
-        ok, _ = self._run([self._dess, "on"])
+        ok, out = self._run([self._dess, "on"])
         if not ok:
             return False
         if not self._verify:
             return True
-        mode = self.read_dess_mode()
-        if mode is None:
-            _logger.warning("DESS Mode could not be read back after 'on'; assuming ok")
-            return True
-        if mode == 0:
-            _logger.error("actuation failed: DESS Mode still 0 after 'on'")
-            return False
-        return True
+        return self._verify_dess(out, want_off=False, what="on")
 
     def set_setpoint(self, watts: int) -> bool:
         target = int(watts)
-        ok, _ = self._run([self._setpoint, str(target)])
+        ok, out = self._run([self._setpoint, str(target)])
         if not ok:
             return False
         if not self._verify:
             return True
-        live = self.read_setpoint()
+        live = self._first_float(_SETPOINT_WRITE_RE, out)
+        if live is None:
+            live = self.read_setpoint()
         if live is None:
             _logger.warning("setpoint could not be read back after write; assuming ok")
             return True

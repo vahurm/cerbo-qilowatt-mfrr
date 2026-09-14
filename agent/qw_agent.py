@@ -31,7 +31,7 @@ from qilowatt import InverterDevice, QilowattMQTTClient, WorkModeCommand
 
 from actuators import DryRunActuator, ScriptActuator
 from mfrr_statemachine import DEFAULT_MFRR_SOURCES, MfrrController
-from startup import config_warnings, recover_leftover_event
+from startup import config_warnings, read_dess_mode, recover_leftover_event
 from telemetry import DbusReader, get_profile
 from telemetry.base import SVC_SYSTEM
 
@@ -630,7 +630,7 @@ def main() -> int:
     # A previous process that died mid-event (crash, kill -9, reboot) leaves
     # DESS off and the setpoint parked; return to normal before going online.
     # In dry-run only the intent is logged.
-    recover_leftover_event(actuator, state_dir=cfg.state_dir)
+    recover_leftover_event(actuator, state_dir=cfg.state_dir, dess_mode=read_dess_mode(reader))
     for warn in config_warnings(cfg, reader):
         _logger.warning("CONFIG WARN: %s", warn)
 

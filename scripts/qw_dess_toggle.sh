@@ -47,6 +47,9 @@
 #   $QW_STATE_DIR/qw_dess_saved_minsoc  — saved original SOC floor X (for restore)
 #   $QW_STATE_DIR/qw_dess_event_minsoc  — the mFRR floor Y we installed
 #   /tmp/qw_dess_off_at                 — Unix ts when 'off' ran (for watchdog)
+#   `on` removes the saved Mode and the off-at stamp, so a saved Mode left on
+#   disk means an event that never got its `on` (crash/reboot) — the agent's
+#   start-up recovery keys on that.
 #
 # Env overrides:
 #   QW_STATE_DIR         (default /data)  — where the saved-state files live
@@ -162,12 +165,12 @@ case "$action" in
       exit 2
     fi
     if [ "$current" = "0" ]; then
-      log "DESS already OFF (Mode=0); not overwriting saved mode"
+      log "DESS already OFF (Mode=0); not overwriting saved mode, live now 0"
     else
       echo "$current" > "$SAVED_MODE_FILE"
       log "Saved original DESS Mode = $current -> $SAVED_MODE_FILE"
       dbus_set "$MODE_PATH" 0
-      log "Set DESS OFF (Mode=0)"
+      log "Set DESS OFF (Mode=0), live now $(dbus_get "$MODE_PATH")"
     fi
     # Lower the shared SOC floor so mFRR can discharge below the arbitrage floor.
     if [ "$touch_floor" = "1" ]; then
@@ -187,10 +190,13 @@ case "$action" in
       log "WARN: $SAVED_MODE_FILE missing, restoring default DESS Mode = 1 (Auto)"
     fi
     dbus_set "$MODE_PATH" "$saved"
-    log "Restored DESS Mode = $saved"
+    log "Restored DESS Mode = $saved, live now $(dbus_get "$MODE_PATH")"
     # Put the arbitrage SOC floor back (safe no-op if we never lowered it).
     restore_floor_after_event
-    rm -f "$OFF_AT_FILE"
+    # The event is over: drop its state so a saved Mode on disk means exactly
+    # one thing — an event that never got its `on` (crash / reboot mid-event),
+    # which is what the agent's start-up recovery keys on.
+    rm -f "$OFF_AT_FILE" "$SAVED_MODE_FILE"
     exit 0
     ;;
 

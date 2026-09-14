@@ -83,7 +83,15 @@ reset() {
   set_dbus "$MODE_PATH" 1
   set_dbus "$MINSOC_PATH" 25.0
 }
+assert_contains() {
+  desc=$1; needle=$2; hay=$3
+  case "$hay" in
+    *"$needle"*) pass=$((pass + 1)); echo "ok   - $desc" ;;
+    *) fail=$((fail + 1)); echo "FAIL - $desc (no '$needle' in: $hay)" ;;
+  esac
+}
 SAVED_MODE="$TMP/state/qw_dess_saved_mode"
+OFF_AT="/tmp/qw_dess_off_at"     # hard-coded in the script (watchdog reads it there)
 SAVED_MINSOC="$TMP/state/qw_dess_saved_minsoc"
 EVENT_MINSOC="$TMP/state/qw_dess_event_minsoc"
 
@@ -181,6 +189,18 @@ assert_eq "saved mode still the original 1" "1"  "$(cat "$SAVED_MODE" 2>/dev/nul
 env QW_STATE_DIR="$TMP/state" QW_MFRR_MIN_SOC=20 sh "$TARGET" on >/dev/null 2>&1
 assert_eq "floor restored to 25"          "25"   "$(get_dbus "$MINSOC_PATH")"
 assert_eq "DESS Mode restored to 1"       "1"    "$(get_dbus "$MODE_PATH")"
+
+echo "=== scenario 13: on clears the saved Mode and the off-at stamp; output carries the live Mode ==="
+reset
+out=$(env QW_STATE_DIR="$TMP/state" sh "$TARGET" off 2>&1)
+assert_contains "off reports live Mode"   "live now 0" "$out"
+assert_eq "saved mode written"            "1"    "$(cat "$SAVED_MODE" 2>/dev/null)"
+out=$(env QW_STATE_DIR="$TMP/state" sh "$TARGET" on 2>&1)
+assert_contains "on reports live Mode"    "live now 1" "$out"
+assert_absent "saved mode removed by on"  "$SAVED_MODE"
+assert_absent "off-at stamp removed by on" "$OFF_AT"
+out=$(env QW_STATE_DIR="$TMP/state" sh "$TARGET" on 2>&1)
+assert_contains "second on falls back to default 1" "restoring default DESS Mode = 1" "$out"
 
 echo "=== scenario 12: unknown off option is rejected ==="
 reset

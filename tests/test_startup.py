@@ -26,14 +26,47 @@ def test_clean_start_does_nothing(tmp_path):
     assert act.calls == []
 
 
-def test_saved_mode_file_triggers_setpoint_zero_then_dess_on(tmp_path, caplog):
+def test_saved_mode_with_dess_live_off_triggers_setpoint_zero_then_dess_on(tmp_path, caplog):
+    """The reboot case: /tmp stamp gone, saved Mode on /data, DESS still 0."""
     (tmp_path / startup.SAVED_MODE_FILE).write_text("1\n")
     act = FakeActuator()
     with caplog.at_level("WARNING"):
-        assert startup.recover_leftover_event(act, str(tmp_path), str(tmp_path / "off_at")) is True
+        assert startup.recover_leftover_event(
+            act, str(tmp_path), str(tmp_path / "off_at"), dess_mode=0.0
+        ) is True
     # Release the setpoint BEFORE restoring DESS so they don't fight.
     assert act.calls == [("set_setpoint", 0), ("dess_on",)]
-    assert any("STARTUP RECOVERY" in r.message and "saved DESS Mode 1" in r.message for r in caplog.records)
+    assert any(
+        "STARTUP RECOVERY" in r.message and "saved DESS Mode 1 (live Mode 0)" in r.message
+        for r in caplog.records
+    )
+
+
+def test_saved_mode_with_unreadable_dess_mode_recovers_conservatively(tmp_path):
+    (tmp_path / startup.SAVED_MODE_FILE).write_text("1")
+    act = FakeActuator()
+    assert startup.recover_leftover_event(act, str(tmp_path), str(tmp_path / "off_at"), dess_mode=None) is True
+    assert act.names() == ["set_setpoint", "dess_on"]
+
+
+def test_stale_saved_mode_with_dess_on_is_removed_not_recovered(tmp_path, caplog):
+    """Left by a toggle script that did not clean up on `on`: DESS is on, no stamp."""
+    saved = tmp_path / startup.SAVED_MODE_FILE
+    saved.write_text("1")
+    act = FakeActuator()
+    with caplog.at_level("INFO"):
+        assert startup.recover_leftover_event(act, str(tmp_path), str(tmp_path / "off_at"), dess_mode=1.0) is False
+    assert act.calls == []
+    assert not saved.exists()
+    assert any("removing stale" in r.message for r in caplog.records)
+
+
+def test_saved_mode_plus_stamp_recovers_even_if_dess_reads_on(tmp_path):
+    """Stamp present = `on` never ran; trust the files over a racing read."""
+    (tmp_path / startup.SAVED_MODE_FILE).write_text("1")
+    (tmp_path / "off_at").write_text(str(int(time.time())))
+    act = FakeActuator()
+    assert startup.recover_leftover_event(act, str(tmp_path), str(tmp_path / "off_at"), dess_mode=1.0) is True
 
 
 def test_off_at_stamp_alone_triggers_recovery_with_age(tmp_path, caplog):
@@ -48,10 +81,28 @@ def test_off_at_stamp_alone_triggers_recovery_with_age(tmp_path, caplog):
     assert re.search(r"DESS off for 1[12]\ds", msg)
 
 
-def test_saved_floor_is_reported(tmp_path):
+def test_saved_floor_alone_is_evidence(tmp_path):
+    """The floor is still lowered even if DESS reads on: `on` restores it."""
     (tmp_path / startup.SAVED_MINSOC_FILE).write_text("40")
-    found = startup.leftover_event(str(tmp_path), str(tmp_path / "off_at"))
+    found = startup.leftover_event(str(tmp_path), str(tmp_path / "off_at"), dess_mode=1.0)
     assert found == "saved SOC floor 40%"
+    act = FakeActuator()
+    assert startup.recover_leftover_event(act, str(tmp_path), str(tmp_path / "off_at"), dess_mode=1.0) is True
+
+
+def test_dess_off_without_any_file_is_the_owners_choice(tmp_path):
+    act = FakeActuator()
+    assert startup.recover_leftover_event(act, str(tmp_path), str(tmp_path / "off_at"), dess_mode=0.0) is False
+    assert act.calls == []
+
+
+def test_read_dess_mode():
+    reader = FakeReader(values={(startup.SVC_SETTINGS, startup.PATH_DESS_MODE): 1.0})
+    assert startup.read_dess_mode(reader) == 1.0
+    assert startup.read_dess_mode(FakeReader()) is None
+    reader.available = False
+    assert startup.read_dess_mode(reader) is None
+    assert startup.read_dess_mode(None) is None
 
 
 def test_failed_recovery_is_logged_as_actuation_failed(tmp_path, caplog):

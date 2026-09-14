@@ -144,8 +144,10 @@ is the reference. The original Node-RED orchestrator lives in
 - **Start-up recovery** (`agent/startup.py`): a process that died mid-event
   (crash, `kill -9`, reboot) leaves `qw_dess_toggle.sh`'s saved-Mode file on
   `/data` and DESS off; the watchdog cannot see a reboot because its stamp is
-  on `/tmp`. Before connecting, the agent checks those files and, if present,
-  writes setpoint 0 and DESS on (`STARTUP RECOVERY` in the log). The
+  on `/tmp`. Before connecting, the agent checks those files against the live
+  DESS Mode and, if they show an unfinished event, writes setpoint 0 and DESS
+  on (`STARTUP RECOVERY` in the log); a stale saved Mode with DESS on is
+  removed. The
   post-connect WORKMODE snapshot reopens the event if it is still running.
 - **Config sanity** (`CONFIG WARN`): event caps vs the watchdog cap, missing or
   example-default import/export caps, `QW_MFRR_MIN_SOC` vs the live floor,
