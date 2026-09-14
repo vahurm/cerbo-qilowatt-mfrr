@@ -152,3 +152,62 @@ def test_metrics_inverter_status_alarms_and_temperature():
     assert m.AlarmCodes == [0, 0, 0, 0, 0, 0]
     assert m.BatteryTemperature == [25.0]
     assert m.InverterTemperature == 25.0
+
+
+# --------------------------------------------------------------------------- #
+# ENERGY.Today / Total from the grid meter
+# --------------------------------------------------------------------------- #
+
+GRID = "com.victronenergy.grid.cgwacs_ttyUSB0_di30_mb1"
+
+
+def test_energy_totals_zero_without_grid_service(tmp_path):
+    daily = base.DailyEnergy(str(tmp_path / "e.json"))
+    e = build_energy_data(_energy_reader(), 15000.0, daily=daily)
+    assert e.Today == 0.0 and e.Total == 0.0
+
+
+def test_energy_total_is_grid_import_and_today_is_since_midnight(tmp_path):
+    now = [1_700_000_000.0]
+    daily = base.DailyEnergy(str(tmp_path / "e.json"), now=lambda: now[0])
+    reader = _energy_reader(
+        extra={(GRID, "/Ac/Energy/Forward"): 1234.5, (GRID, "/Ac/Energy/Reverse"): 99.0},
+        services={base.SVC_GRID_PREFIX: GRID},
+    )
+    e = build_energy_data(reader, 15000.0, daily=daily)
+    assert e.Total == 1234.5
+    assert e.Today == 0.0          # first sample of the day is the baseline
+
+    reader.values[(GRID, "/Ac/Energy/Forward")] = 1240.0
+    e = build_energy_data(reader, 15000.0, daily=daily)
+    assert e.Today == 5.5
+
+
+def test_daily_baseline_survives_restart_and_rolls_at_midnight(tmp_path):
+    path = str(tmp_path / "e.json")
+    now = [1_700_000_000.0]
+    d1 = base.DailyEnergy(path, now=lambda: now[0])
+    assert d1.today(100.0) == 0.0
+    assert d1.today(103.0) == 3.0
+
+    d2 = base.DailyEnergy(path, now=lambda: now[0])   # "restart"
+    assert d2.today(104.0) == 4.0
+
+    now[0] += 86400.0                                   # next day
+    assert d2.today(110.0) == 0.0
+    assert d2.today(111.5) == 1.5
+
+
+def test_daily_rebases_when_counter_goes_backwards(tmp_path):
+    d = base.DailyEnergy(str(tmp_path / "e.json"), now=lambda: 1_700_000_000.0)
+    assert d.today(500.0) == 0.0
+    assert d.today(10.0) == 0.0     # meter replaced / reset
+    assert d.today(12.0) == 2.0
+
+
+def test_grid_energy_kwh_handles_missing_and_invalid():
+    assert base.grid_energy_kwh(_energy_reader()) == (None, None)
+    reader = _energy_reader(
+        extra={(GRID, "/Ac/Energy/Forward"): "x"}, services={base.SVC_GRID_PREFIX: GRID}
+    )
+    assert base.grid_energy_kwh(reader) == (None, None)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from telemetry import ac_coupled, base, dc_coupled, get_profile
+from telemetry import ac_coupled, auto, base, dc_coupled, get_profile
 
 SYS = base.SVC_SYSTEM
 PVINV = "com.victronenergy.pvinverter.cg_30"
@@ -66,13 +66,52 @@ def test_ac_coupled_sums_three_phases():
 # --------------------------------------------------------------------------- #
 
 def test_get_profile_known():
+    assert get_profile("auto") is auto
     assert get_profile("dc_coupled") is dc_coupled
     assert get_profile("ac_coupled") is ac_coupled
 
 
-def test_get_profile_defaults_to_dc_coupled():
-    assert get_profile("") is dc_coupled
-    assert get_profile(None) is dc_coupled
+def test_get_profile_defaults_to_auto():
+    assert get_profile("") is auto
+    assert get_profile(None) is auto
+
+
+# --------------------------------------------------------------------------- #
+# auto (default): DC MPPT + PvOnOutput + PvOnGrid, all on the system service
+# --------------------------------------------------------------------------- #
+
+def test_auto_sums_dc_and_both_ac_positions():
+    reader = _reader(
+        values={
+            (SYS, "/Dc/Pv/Power"): 4000,
+            (SYS, "/Ac/PvOnOutput/L1/Power"): 1000,
+            (SYS, "/Ac/PvOnOutput/L2/Power"): 1100,
+            (SYS, "/Ac/PvOnOutput/L3/Power"): 900,
+            (SYS, "/Ac/PvOnGrid/L1/Power"): 500,
+        }
+    )
+    assert auto._pv_power(reader) == 7500.0
+
+
+def test_auto_matches_dc_profile_on_a_dc_only_site():
+    reader = _reader(values={(SYS, "/Dc/Pv/Power"): 4000})
+    assert auto._pv_power(reader) == dc_coupled._pv_power(reader) == 4000.0
+
+
+def test_auto_matches_ac_profile_on_an_ac_only_site():
+    reader = _reader(
+        values={
+            (SYS, "/Ac/PvOnOutput/L1/Power"): 1000,
+            (SYS, "/Ac/PvOnOutput/L2/Power"): 1100,
+            (SYS, "/Ac/PvOnOutput/L3/Power"): 900,
+        }
+    )
+    assert auto._pv_power(reader) == ac_coupled._pv_power(reader) == 3000.0
+
+
+def test_auto_missing_paths_read_as_zero_and_clamps_negative():
+    assert auto._pv_power(_reader()) == 0.0
+    assert auto._pv_power(_reader(values={(SYS, "/Dc/Pv/Power"): -5})) == 0.0
 
 
 def test_get_profile_is_case_and_space_insensitive():

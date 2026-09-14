@@ -17,8 +17,11 @@ Design notes:
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Callable, List, Optional
+import os
+import time
+from typing import Callable, List, Optional, Tuple
 
 try:
     import dbus  # python3-dbus, system package on Venus OS
@@ -38,6 +41,10 @@ SVC_SETTINGS = "com.victronenergy.settings"
 # Dynamic service names (contain a serial); discovered at runtime by prefix.
 SVC_VEBUS_PREFIX = "com.victronenergy.vebus"
 SVC_PVINVERTER_PREFIX = "com.victronenergy.pvinverter"
+SVC_GRID_PREFIX = "com.victronenergy.grid"
+
+# Where the midnight baseline for ENERGY.Today is kept between restarts.
+ENERGY_STATE_FILE = os.environ.get("QW_ENERGY_STATE_FILE", "/data/qw-agent/energy_today.json")
 
 # Dynamic ESS / export-limit setting used for the GridExportLimit metric.
 PATH_MAX_FEEDIN = "/Settings/CGwacs/MaxFeedInPower"
@@ -143,15 +150,99 @@ def volt(value: Optional[float]) -> float:
     return round(v, 1) if v >= 50.0 else 230.0
 
 
-def build_energy_data(reader: DbusReader, grid_export_limit_w: float) -> EnergyData:
+class DailyEnergy:
+    """Turns a lifetime kWh counter into a since-midnight value.
+
+    The grid meter only exposes lifetime import/export (``/Ac/Energy/Forward``
+    / ``Reverse``). The baseline at local midnight is persisted so a restart
+    does not reset "Today" to zero. Missing counter -> 0.0 for both fields.
+    """
+
+    def __init__(self, path: str = ENERGY_STATE_FILE, now=time.time) -> None:
+        self._path = path
+        self._now = now
+        self._day: Optional[str] = None
+        self._base: Optional[float] = None
+        self._load()
+
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d", time.localtime(self._now()))
+
+    def _load(self) -> None:
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self._day = str(data.get("day"))
+            self._base = float(data.get("base_kwh"))
+        except (OSError, ValueError, TypeError):
+            self._day, self._base = None, None
+
+    def _save(self) -> None:
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"day": self._day, "base_kwh": self._base}, fh)
+            os.replace(tmp, self._path)
+        except OSError as exc:  # pragma: no cover - read-only FS etc.
+            _logger.debug("energy baseline not saved: %s", exc)
+
+    def today(self, total_kwh: Optional[float]) -> float:
+        if total_kwh is None:
+            return 0.0
+        day = self._today()
+        if self._day != day or self._base is None or total_kwh < self._base:
+            # New day (or counter reset/replaced): rebase.
+            self._day, self._base = day, float(total_kwh)
+            self._save()
+        return round(total_kwh - self._base, 3)
+
+
+_daily_import: Optional[DailyEnergy] = None
+
+
+def _default_daily() -> DailyEnergy:
+    global _daily_import
+    if _daily_import is None:
+        _daily_import = DailyEnergy()
+    return _daily_import
+
+
+def grid_energy_kwh(reader: DbusReader) -> Tuple[Optional[float], Optional[float]]:
+    """Lifetime (import, export) kWh from the grid meter service, or Nones."""
+    grid = reader.find_service(SVC_GRID_PREFIX)
+    if not grid:
+        return None, None
+    fwd = reader.get(grid, "/Ac/Energy/Forward", None)
+    rev = reader.get(grid, "/Ac/Energy/Reverse", None)
+    try:
+        fwd_f = None if fwd is None else float(fwd)
+    except (TypeError, ValueError):
+        fwd_f = None
+    try:
+        rev_f = None if rev is None else float(rev)
+    except (TypeError, ValueError):
+        rev_f = None
+    return fwd_f, rev_f
+
+
+def build_energy_data(
+    reader: DbusReader, grid_export_limit_w: float, daily: Optional[DailyEnergy] = None
+) -> EnergyData:
     """ENERGY block: grid-side AC measurements (per phase) + totals.
 
     Identical across topologies — the grid meter is the grid meter regardless of
     where PV is coupled. /Ac/Grid/L{n}/Power on com.victronenergy.system is
     confirmed in use by site B's curtailment flow.
 
-    VALIDATE: Qilowatt's ENERGY.Power sign convention and Today/Total source
-    against the live SENSOR payload for the target system.
+    Today/Total are grid IMPORT energy from the grid-meter service
+    (``/Ac/Energy/Forward``, kWh): Total is the lifetime counter, Today is
+    since local midnight (baseline persisted). Sites without a grid meter
+    service report 0.0 for both, as before.
+
+    VALIDATE: Qilowatt's ENERGY.Power sign convention and whether Today/Total
+    is expected as import, export or net, against the live SENSOR payload of
+    a reference (Deye/Sunsynk) device.
 
     Grid voltage/frequency are NOT on com.victronenergy.system on all systems
     (site A raised DBusException). They are read from the vebus AC-input instead
@@ -160,6 +251,8 @@ def build_energy_data(reader: DbusReader, grid_export_limit_w: float) -> EnergyD
     """
     power = phases_float(reader, SVC_SYSTEM, "/Ac/Grid/L{n}/Power")
     current = phases_float(reader, SVC_SYSTEM, "/Ac/Grid/L{n}/Current")
+    import_total, _export_total = grid_energy_kwh(reader)
+    today = (daily or _default_daily()).today(import_total)
 
     vebus = reader.find_service(SVC_VEBUS_PREFIX)
     if vebus:
@@ -172,8 +265,8 @@ def build_energy_data(reader: DbusReader, grid_export_limit_w: float) -> EnergyD
 
     return EnergyData(
         Power=[z(p) for p in power],
-        Today=0.0,   # VALIDATE: map to grid/inverter daily energy if required
-        Total=0.0,   # VALIDATE: map to lifetime energy if required
+        Today=today,
+        Total=round(import_total, 3) if import_total is not None else 0.0,
         Current=[z(c) for c in current],
         Voltage=[volt(v) for v in voltage],
         Frequency=frequency,
