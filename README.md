@@ -108,9 +108,16 @@ No credentials live in this repository — per-site values stay in an untracked
 
 ## Status
 
-Pre-release. Piloted on a Victron Cerbo GX (3× MultiPlus-II + DESS). Telemetry
-field mapping should be validated against the Qilowatt `SENSOR` payload for your
-specific system before relying on market settlement.
+In production on two Victron ESS sites since 2026-07 (3× MultiPlus-II + DESS
+each; one DC-coupled, one AC-coupled PV), dispatched through KratTrade (`kratt`)
+and Qilowatt's own desk (`qilowatt`), with Q trades actuated since 2026-09.
+Every measured number in the docs and comments comes from those two sites'
+logs; your site will differ — measure with `tools/afrr_probe.py` before
+copying the values.
+
+Telemetry field mapping should be validated against the Qilowatt `SENSOR`
+payload for your specific system before relying on market settlement. Not
+affiliated with Qilowatt; use at your own risk (see `docs/SAFETY.md`).
 
 ## Credits & license
 

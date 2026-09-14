@@ -21,10 +21,21 @@ if you want a co-resident curtailment flow or a dashboard.
 
 > **One client per device.** Qilowatt allows a single active MQTT client per
 > `device_id`. If a Home Assistant `qilowatt-ha` integration currently uses these
-> credentials, retire it before starting the agent here (see the cutover note in
-> the project plan). Run the agent in `QW_DRY_RUN=1` first to validate without
-> contending — but the cloud link still consumes the single client slot, so do
-> the dry-run in a brief window with `qilowatt-ha` stopped.
+> credentials, retire it before starting the agent here. Run the agent in
+> `QW_DRY_RUN=1` first to validate without contending — but the cloud link still
+> consumes the single client slot, so do the dry-run in a brief window with
+> `qilowatt-ha` (or a previously running agent) stopped.
+
+## 0. The short way
+
+[`deploy/install.sh`](../deploy/install.sh) does steps 1–3 and 6 (plus the
+diagnostics and the hourly log audit) in one idempotent run from your
+workstation; you then do steps 4 and 5 by hand. The rest of this page is the
+manual equivalent, for understanding what lands where.
+
+```sh
+CERBO_HOST=root@<cerbo-ip> ./deploy/install.sh
+```
 
 ## 1. Actuator scripts
 
@@ -32,7 +43,8 @@ if you want a co-resident curtailment flow or a dashboard.
 scp scripts/qw_dess_toggle.sh   root@<cerbo-ip>:/data/
 scp scripts/qw_grid_setpoint.sh root@<cerbo-ip>:/data/
 scp scripts/qw_dess_watchdog.sh root@<cerbo-ip>:/data/
-ssh root@<cerbo-ip> 'chmod 750 /data/qw_dess_toggle.sh /data/qw_grid_setpoint.sh /data/qw_dess_watchdog.sh'
+scp scripts/qw_log_audit.sh     root@<cerbo-ip>:/data/
+ssh root@<cerbo-ip> 'chmod 750 /data/qw_dess_toggle.sh /data/qw_grid_setpoint.sh /data/qw_dess_watchdog.sh /data/qw_log_audit.sh'
 ```
 
 Quick test (returns the system to normal afterwards):
@@ -56,6 +68,11 @@ Start it now without rebooting:
 ```sh
 ssh root@<cerbo-ip> "nohup sh -c 'while true; do /data/qw_dess_watchdog.sh; sleep 60; done' >/dev/null 2>&1 &"
 ```
+
+The same file should carry the hourly log audit loop
+(`/data/qw_log_audit.sh`, see [SAFETY.md](SAFETY.md)) — `install.sh` adds both
+and checks on every run that they are actually running, not merely present in
+`rc.local`.
 
 ## 3. Python agent + dependencies
 
@@ -97,6 +114,16 @@ ssh root@<cerbo-ip> 'chmod 600 /data/qw-agent.env'
 # set QW_TELEMETRY_PROFILE and the QW_MAX_IMPORT_W / QW_MAX_EXPORT_W limits.
 ```
 
+Then decide the site-specific policy knobs, each explained in `.env.example`:
+
+| Variable | Decide |
+|---|---|
+| `QW_MFRR_SOURCES` | which dispatchers to obey (`fusebox,kratt`, plus `qilowatt` if your trader uses it — check with `afrr_probe.py`) |
+| `QW_MFRR_MIN_SOC` | how deep mFRR may discharge; must be *below* the dashboard Minimum SOC |
+| `QW_TRADE_MODES` | honour Qilowatt's Q trades (`buy,sell`, default) or drop them (empty) |
+| `QW_MAX_EVENT_S`, `QW_MAX_TRADE_S` | event caps; both must stay below the watchdog's `QW_MAX_OFF_SECS` |
+| `QW_IDLE_REFRESH_S` | restart-on-silence backstop; keep above the site's real command silence or set 0 |
+
 > **QW_DEVICE_ID gotcha:** this is the MQTT topic id (`Q/<id>/SENSOR`,
 > `Q/<id>/cmnd/backlog`). When migrating off `qilowatt-ha`, use the config
 > entry's **`inverter_id`** (a UUID), not the account-level `device_id` hex
@@ -110,10 +137,17 @@ PYTHONPATH=/data/qw-agent/pylib QW_AGENT_ENV=/data/qw-agent.env \
   QW_DRY_RUN=1 python3 /data/qw-agent/qw_agent.py
 ```
 
-Confirm in the logs that WORKMODE commands decode correctly, telemetry reports
-sane PV/battery/grid values, and that simulated events log the intended
-`DESS off → setpoint → setpoint 0 → DESS on` sequence. Compare the telemetry
+Confirm in the logs that WORKMODE commands decode correctly (the portal pushes a
+snapshot ~20 s after connect), telemetry reports sane PV/battery/grid values,
+and that the startup line shows the policy you intended
+(`mFRR sources=…; Q trades enabled/DISABLED …; limits import=… export=…`).
+Any event during the window logs the intended `DESS off → setpoint →
+setpoint 0 → DESS on` sequence as `[dry-run]` lines. Compare the telemetry
 against VRM / the previous `qilowatt-ha` sensors before going live.
+
+Stop the dry-run with SIGTERM to the agent's own pid — `pkill -f qw_agent.py`
+from an SSH one-liner also matches the SSH shell that contains the same
+string, and kills your session before it restarts the service.
 
 ## 6. Run as a service (daemontools)
 
@@ -169,22 +203,34 @@ flowing. With `QW_LOCAL_BRIDGE=1` you can also watch the decoded values:
 mosquitto_sub -h 127.0.0.1 -t 'qw/#' -v
 ```
 
+On the Cerbo itself:
+
+```sh
+svstat /service/qw-agent                       # up, pid, uptime
+tail -F /var/log/qw-agent/current              # mFRR/TRADE START/END lines
+/data/qw_dess_toggle.sh status                 # DESS Mode + SOC floor, saved state
+/data/qw_log_audit.sh                          # what changed since the last hour
+python3 /data/qw-agent/afrr_probe.py --log /data/afrr-workmode.log   # stream classifier
+```
+
 ## Development: running the tests
 
-The agent logic is covered by a `pytest` suite plus a dependency-free POSIX-sh
-test for the setpoint clamp. They need no Cerbo, dbus, or network — dbus access
-degrades to zeros off Venus OS, and the actuators / telemetry are driven through
-fakes. Run them on a workstation:
+The agent logic is covered by a `pytest` suite plus dependency-free POSIX-sh
+tests for the three shell scripts. They need no Cerbo, dbus, or network — dbus
+access degrades to zeros off Venus OS, and the actuators / telemetry / `dbus`
+CLI are driven through fakes. Run them on a workstation:
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r agent/requirements.txt -r requirements-dev.txt
-pytest -q                      # state machine, telemetry, config, actuators
+pytest -q                      # state machine, telemetry, config, actuators, probe
 sh tests/test_grid_setpoint.sh # asymmetric import/export clamp
+sh tests/test_dess_toggle.sh   # DESS + SOC-floor save/lower/restore, --no-floor
+sh tests/test_log_audit.sh     # audit findings, incremental window, silence check
 ```
 
-CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs both on every
-push and pull request.
+CI ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) runs all of them
+on every push and pull request.
 
 ## Uninstall / rollback
 

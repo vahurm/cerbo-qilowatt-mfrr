@@ -147,9 +147,9 @@ def test_idle_refresh_default_clears_the_measured_command_silence(monkeypatch):
 
     A restart makes the portal push a snapshot ~20 s later, which resets this
     timer — so a default below a site's real gaps both restarts for nothing and
-    erases the evidence needed to correct it. site B ran that loop for weeks at
+    erases the evidence needed to correct it. Site B ran that loop for weeks at
     the old 6 h default: 49 of its 70 starts were this watchdog, and its measured
-    median gap came out as the setting itself. site A then repeated it at the
+    median gap came out as the setting itself. Site A then repeated it at the
     48 h default: 3 silences of exactly 48.0 h over 72.6 d (2026-09-14 probe).
 
     These are measured maxima (tools/afrr_probe.py over the durable WORKMODE

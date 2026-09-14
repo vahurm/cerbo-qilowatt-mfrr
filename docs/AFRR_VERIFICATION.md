@@ -4,10 +4,11 @@ Qilowatt [opened the aFRR market](https://qilowatt.eu/afrr/) and states that for
 customers on a **Qilowatt hardware controller** (Modbus R2 etc.) it is automatic
 — "same contract, same controller, nothing to configure". This repo is **not**
 that: it is a custom Python agent that impersonates a Qilowatt inverter via
-`qilowatt-py` and implements an **mFRR-only** state machine
-([`agent/mfrr_statemachine.py`](../agent/mfrr_statemachine.py), acts only on
-`_source in {fusebox, kratt}` + `Mode in {frrup, frrdown}` + non-zero
-`PowerLimit`).
+`qilowatt-py` and implements a **block-event** state machine
+([`agent/mfrr_statemachine.py`](../agent/mfrr_statemachine.py)) that acts only
+on mFRR dispatch (`_source` in `QW_MFRR_SOURCES` + `Mode` `frrup`/`frrdown`)
+and on Q trades (`_source: qilowatt` + `Mode` `buy`/`sell`), each with a
+non-zero `PowerLimit`. It has no continuous-regulation path.
 
 So the "nothing to do" promise does **not** automatically apply here. This is a
 **verify-only** procedure: observe what actually arrives, classify it, and
@@ -77,6 +78,13 @@ The aFRR fingerprint it looks for:
 - **only sparse `kratt`/`fusebox` FRR blocks** -> `block_mfrr` -> UNAFFECTED
 - **nothing FRR/unknown** -> `inconclusive` -> capture longer
 
+Every Mode documented by qilowatt-ha (`frrup`, `frrdown`, `buy`, `sell`,
+`normal`, `savebattery`, `limitexport`, `pvsell`, `nobattery`) is *known*, so
+the Energy Optimizer's arbitrage traffic does not trip `unrecognized_signal`.
+Q trades (`qilowatt` + `buy`/`sell`) are counted in their own block — how many,
+median power, and how many were followed by FRR dispatch within 2 h — because
+that ratio is what justifies actuating them at all.
+
 ## Step 3 — Cross-check
 
 - Correlate the capture timestamps with aFRR activations shown in the Qilowatt
@@ -91,11 +99,11 @@ The aFRR fingerprint it looks for:
 
 ## Step 4 — Decide
 
-### site A (cerbo, Venus OS v3.75) — recorded 2026-07-07
+### Site A (DC-coupled, Venus OS v3.75) — recorded 2026-07-07
 
 ```
 Capture window : ~2026-07-03 .. 2026-07-07 (multilog ring, ~4 days)
-Site           : site A (dc_coupled), device Q/<id>/  agent up 3.5 d
+Site           : site A (dc_coupled), agent up 3.5 d
 Sample size    : 242 WORKMODE commands
 Sources        : kratt=216, notimer=26        (no unknown sources)
 Modes          : frrup=192, frrdown=24, normal=26   (no unknown modes)
@@ -116,6 +124,27 @@ sub-10 s continuous regulation that would trip the `continuous_modulation`
 fingerprint — so the block-event state machine is not at risk of DESS thrash
 (confirmed in the logs). Practically, "nothing to do" holds for this custom
 agent too: it is already processing the whole KratTrade stream.
+
+### Re-run over the durable capture — 2026-09-14
+
+```
+                    site A (dc_coupled)        site B (ac_coupled)
+Capture window      72.7 d, 4564 commands       64.8 d, 3549 commands
+Sources             kratt 3507, optimizer 586,  kratt 2970, notimer 533,
+                    notimer 411, qilowatt 60    qilowatt 42, optimizer 4
+FRR cadence         median 60.6 s               median 61.0 s
+Unrecognized        0                           0
+Q trades            39 buy, median 24 kW,       29 buy, median 9.9 kW,
+                    26/39 followed by FRR       24/29 followed by FRR
+                    (median gap 14 min)         (median gap 15 min)
+Verdict             block_mfrr -> UNAFFECTED    block_mfrr -> UNAFFECTED
+```
+
+Two months of data on both sites confirm the July call: no aFRR fingerprint
+on the WORKMODE stream. What *did* appear was the `qilowatt`/`buy` trade
+(first seen 2026-07-14, growing month over month), which is now actuated —
+see [SAFETY.md](SAFETY.md#two-kinds-of-event). Before the classifier learned
+the Optimizer's Modes, the same data produced a false `SAFE-BUT-IDLE`.
 
 ### Remaining human confirmation (cannot be done from the agent)
 

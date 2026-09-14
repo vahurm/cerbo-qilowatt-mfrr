@@ -21,6 +21,23 @@ global.set('qw_mfrr', { active: false, mode: '', signed_watts: 0, ts: <ms> });
 Because both flows run in the same Node-RED instance, they share `global` context
 — no extra wiring or MQTT needed.
 
+**If the Python agent is the orchestrator** (the normal setup — `flow.json`'s
+state machine stays disabled), the flag does not come from `global`. Set
+`QW_LOCAL_BRIDGE=1` and subscribe to the retained topics the agent publishes:
+
+| Topic               | Payload                         |
+|---------------------|---------------------------------|
+| `qw/mfrr_active`    | `on` while any event is running |
+| `qw/mfrr_kind`      | `frr` / `trade` / `none`        |
+| `qw/mfrr_signed_w`  | signed W (negative = export)    |
+| `qw/qw_mode`        | `frrup` / `frrdown` / `buy` / `sell` / … |
+
+Map them into the same `qw_mfrr` object (`active = mfrr_active == 'on'`,
+`mode = qw_mode`, `signed_watts = mfrr_signed_w`) and the patch below works
+unchanged. `mfrr_active` is `on` for Q trades too: a `sell` is an export like
+`frrup`, and holding PV at 100 % during a `buy` costs nothing — treat
+`mode === 'sell'` like `frrup` in the branch below.
+
 ## Patch the curtailment `decide_fn`
 
 Add this near the **top** of the curtailment decision function, before the normal

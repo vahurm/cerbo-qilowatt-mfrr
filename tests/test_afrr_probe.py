@@ -109,7 +109,7 @@ def test_empty_or_normal_only_is_inconclusive():
 
 
 def test_optimizer_modes_are_known_and_do_not_trip_the_unrecognized_alarm():
-    """site A 2026-07..08: 586 `optimizer` commands (normal/savebattery/
+    """Site A 2026-07..08: 586 `optimizer` commands (normal/savebattery/
     limitexport/buy/sell) made the probe report SAFE-BUT-IDLE on a stream that
     was plain block mFRR. Every documented qilowatt-ha Mode is known."""
     recs = [_frr(0, 3000), _frr(300, 3000)] + [

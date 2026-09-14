@@ -1,6 +1,6 @@
 """Tests for connect_with_retry — surviving a transient resolve failure at boot.
 
-Venus OS starts the service before the network is reliably up. site A crashed on
+Venus OS starts the service before the network is reliably up. Site A crashed on
 ``socket.gaierror`` from the initial connect roughly twice a day (47 of 50
 restarts in one log ring), so the first connect gets a bounded backoff before we
 give up and let the supervisor take over.
