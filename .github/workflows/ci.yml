@@ -7,14 +7,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.8 = older Venus OS builds, 3.12 = current Cerbo GX (v3.5x+),
+        # 3.10 in between.
+        python-version: ["3.8", "3.10", "3.12"]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          # Match the Venus OS / Cerbo runtime (Python 3.12.x).
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |
@@ -32,3 +37,16 @@ jobs:
 
       - name: Run shell tests (log audit)
         run: sh tests/test_log_audit.sh
+
+      - name: Run shell tests (doctor)
+        run: sh tests/test_doctor.sh
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck POSIX-sh scripts (Venus OS BusyBox)
+        run: |
+          sudo apt-get install -y shellcheck
+          shellcheck -S warning -s sh -e SC2039,SC3043 scripts/*.sh tools/afrr_capture.sh
+          shellcheck -S warning -s bash deploy/install.sh

@@ -19,6 +19,7 @@
 # =============================================================================
 OUT=/data/afrr-workmode.log
 LOG=/var/log/qw-agent/current
+# shellcheck disable=SC2125  # intentional glob, expanded unquoted below
 ARCHIVE_GLOB=/var/log/qw-agent/@*.s
 
 case "${1:-start}" in
