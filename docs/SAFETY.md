@@ -111,6 +111,13 @@ charges.
    12.5 min), every one ending only because an unrelated later command happened
    to arrive.
 
+   The portal device chip shows that same command unless the agent replaces
+   it. `SENSOR.WORKMODE` is the applied state: after a zero-power stand-down
+   the chip goes to `normal` / 0 W, and `BatterySoc` there is the measured
+   charge, not the discharge floor Kratt puts on the `frrup` command. Holding
+   the 0 W command as the echo would leave the chip on FRRUP at the floor
+   percentage while the battery is full.
+
    **A dispatch during a trade (or vice versa) switches the event in place.**
    WorkMode is a single-state channel, so the newer command wins; the setpoint
    is rewritten without a DESS on/off cycle in between, because a few seconds

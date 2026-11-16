@@ -27,15 +27,16 @@ import time
 from typing import Dict, Optional
 
 import paho.mqtt.client as mqtt
-from qilowatt import InverterDevice, QilowattMQTTClient, WorkModeCommand
+from qilowatt import QilowattMQTTClient, WorkModeCommand
 
 from actuators import DryRunActuator, ScriptActuator
 from mfrr_statemachine import DEFAULT_MFRR_SOURCES, MfrrController
+from reported_workmode import ReportingInverterDevice, WorkmodeReporter
 from startup import config_warnings, read_dess_mode, recover_leftover_event
 from telemetry import DbusReader, get_profile
 from telemetry.base import SVC_SYSTEM
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 _logger = logging.getLogger("qw_agent")
 
@@ -305,7 +306,7 @@ class TelemetryLoop(threading.Thread):
     UNAVAILABLE_LOG_INTERVAL_S = 60.0
 
     def __init__(
-        self, cfg: Config, device: InverterDevice, profile, reader: Optional[DbusReader] = None
+        self, cfg: Config, device, profile, reader: Optional[DbusReader] = None
     ) -> None:
         super().__init__(name="TelemetryLoop", daemon=True)
         self._cfg = cfg
@@ -316,6 +317,9 @@ class TelemetryLoop(threading.Thread):
         self._last_unavailable_log: Optional[float] = None
         self.published = 0
         self.skipped = 0
+        # Fired after a successful cycle so the SENSOR WORKMODE echo can pick
+        # up a fresh measured SOC without waiting for the next command.
+        self.on_published = None
         if not self._reader.available:
             _logger.warning("dbus not available — telemetry will NOT be published")
 
@@ -354,6 +358,11 @@ class TelemetryLoop(threading.Thread):
             _logger.info("telemetry available again after %d skipped cycles", self.skipped)
             self._last_unavailable_log = None
         self.published += 1
+        if self.on_published is not None:
+            try:
+                self.on_published()
+            except Exception as exc:
+                _logger.error("telemetry follow-up failed: %s", exc)
         return True
 
     def run(self) -> None:
@@ -674,6 +683,7 @@ def main() -> int:
         if bridge is not None:
             bridge.publish_mfrr(state, signed, controller.kind, controller.degraded)
         write_state_file(cfg.state_file, controller)
+        refresh_reported()
 
     controller.on_state_change = publish_state
     # Republish the current state on every QW (re)connect so a retained
@@ -687,7 +697,16 @@ def main() -> int:
     )
     write_state_file(cfg.state_file, controller)
 
-    device = InverterDevice(device_id=cfg.device_id)
+    device = ReportingInverterDevice(device_id=cfg.device_id)
+    # Portal chip reads SENSOR.WORKMODE. Report the applied mode and the
+    # measured SOC, not the raw command (whose BatterySoc is a floor/target).
+    reporter = WorkmodeReporter(device, controller, make_soc_reader(reader))
+
+    def refresh_reported() -> None:
+        try:
+            reporter.update()
+        except Exception as exc:
+            _logger.error("reported WORKMODE update failed: %s", exc)
 
     watchdog = ConnectionWatchdog(
         link_restart_s=cfg.link_restart_s,
@@ -703,6 +722,9 @@ def main() -> int:
                 handler(command)
             except Exception as exc:
                 _logger.error("command handler %s error: %s", handler, exc)
+        # A command that leaves the machine IDLE (zero-power stand-down,
+        # ignored mode) does not always fire on_state_change. Refresh anyway.
+        refresh_reported()
 
     device.set_command_callback(on_command)
 
@@ -716,6 +738,11 @@ def main() -> int:
     )
 
     telemetry = TelemetryLoop(cfg, device, profile, reader=reader)
+    telemetry.on_published = refresh_reported
+    # Echo the measured SOC before the first SENSOR. The library default is
+    # Mode=normal with no BatterySoc, which the chip would show as a blank
+    # percentage until the next command.
+    refresh_reported()
     # Start telemetry only once the link is up. Setting the first energy+metrics
     # data triggers qilowatt-py's start_timers(), which publishes STATUS0
     # immediately; doing that before the MQTT connection is established loses the

@@ -5,6 +5,17 @@ All notable changes to this project. The format follows
 and the agent reports its `__version__` (plus the install's git SHA from
 `/data/qw-agent/VERSION`) at start-up.
 
+## [1.0.1] — 2026-11-16
+
+### Fixed
+- `SENSOR.WORKMODE` reports the applied mode and the measured SOC. qilowatt-py
+  echoes the last inbound command, and the portal device chip displays it. A
+  Kratt stand-down (`frrup`, `PowerLimit` 0, `BatterySoc` = the discharge
+  floor) left the chip on FRRUP / 0 W / that floor after the agent had already
+  released the setpoint and restored DESS. IDLE is reported as `normal` / 0 W;
+  an active event is reported as `frrup` / `frrdown` / `buy` / `sell` with the
+  applied magnitude. The measured SOC is refreshed on every telemetry cycle.
+
 ## [1.0.0] — 2026-09-14
 
 First tagged release: the state the two production sites run, hardened for

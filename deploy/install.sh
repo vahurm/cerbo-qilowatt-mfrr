@@ -114,6 +114,7 @@ echo "==> Installing agent to /data/qw-agent"
 ssh_ 'mkdir -p /data/qw-agent/pylib'
 scp_ "$REPO_DIR"/agent/qw_agent.py "$REPO_DIR"/agent/mfrr_statemachine.py \
      "$REPO_DIR"/agent/actuators.py "$REPO_DIR"/agent/startup.py \
+     "$REPO_DIR"/agent/reported_workmode.py \
      "$REPO_DIR"/agent/requirements.txt \
      "$CERBO_HOST":/data/qw-agent/
 scp_ -r "$REPO_DIR"/agent/telemetry "$CERBO_HOST":/data/qw-agent/

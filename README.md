@@ -124,11 +124,18 @@ trades as well.
 before it reaches `qw_grid_setpoint.sh`, whose clamp would otherwise *reject* an
 oversized request and leave the previous setpoint in place.
 
+The portal device chip does not read the flow-diagram measurements. It reads
+`WORKMODE` inside `SENSOR`. The agent fills that with the mode it is actually
+applying and with the measured SOC (`reported WORKMODE` in the log). A
+zero-power `frrup` stand-down therefore shows as `normal`, not as FRRUP at
+the command's floor SOC.
+
 ## Repository layout
 
 ```
 agent/        qw_agent.py, mfrr_statemachine.py, actuators.py (read-back), startup.py
-              (recovery + config sanity), telemetry/ (auto + legacy profiles)
+              (recovery + config sanity), reported_workmode.py (portal chip echo),
+              telemetry/ (auto + legacy profiles)
 scripts/      qw_dess_toggle.sh, qw_grid_setpoint.sh, qw_dess_watchdog.sh,
               qw_log_audit.sh (hourly audit, QW_ALERT_URL), qw_doctor.sh (self-check)
 tools/        afrr_probe.py (WORKMODE classifier), replay.py (offline "what would

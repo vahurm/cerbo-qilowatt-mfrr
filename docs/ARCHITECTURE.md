@@ -48,6 +48,15 @@ Uses the official [`qilowatt-py`](https://github.com/qilowatt/qilowatt-py)
 - publishes telemetry on the library's schedule: `Q/{device_id}/SENSOR` (~10 s),
   `STATE` (~60 s), `STATUS0` (startup + hourly), read from dbus through a
   per-site profile (`dc_coupled` / `ac_coupled`);
+- rewrites `SENSOR.WORKMODE` so it is the **applied** state, not the raw
+  command. The portal device chip reads `Mode`, `PowerLimit` and `BatterySoc`
+  from that object. qilowatt-py would otherwise echo the last inbound command,
+  and a Kratt stand-down (`frrup`, `PowerLimit` 0, `BatterySoc` = the discharge
+  floor) stays on the chip after the agent has released the setpoint. IDLE is
+  reported as `normal` / 0 W with the measured SOC; an active event is
+  reported as `frrup` / `frrdown` / `buy` / `sell` with the applied magnitude.
+  The measured SOC is refreshed on every telemetry cycle. The local bridge
+  still republishes the raw command;
 - runs the periodic `tick()` (failsafes, trade SOC target) and the
   `ConnectionWatchdog` (restart on a dead or deaf session);
 - with `QW_LOCAL_BRIDGE=1`, republishes the decoded command and the event

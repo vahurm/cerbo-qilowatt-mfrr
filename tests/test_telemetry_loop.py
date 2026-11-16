@@ -31,7 +31,10 @@ def _loop(reader):
 def test_publishes_when_soc_readable():
     reader = FakeReader(values={(base.SVC_SYSTEM, "/Dc/Battery/Soc"): 55.0})
     loop, dev = _loop(reader)
+    seen = []
+    loop.on_published = lambda: seen.append(1)
     assert loop.update_once() is True
+    assert seen == [1]
     assert len(dev.energy) == 1 and len(dev.metrics) == 1
     assert dev.metrics[0].BatterySOC == 55
     assert loop.published == 1 and loop.skipped == 0
